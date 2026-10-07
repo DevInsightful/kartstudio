@@ -13,12 +13,12 @@
 
 | Field | Status |
 |---|---|
-| Overall status | Account import and selected-row organization implemented; user testing pending |
-| Current step | 05 — Account Management UI (mail/password import, table selection, categories, tags, notes) |
+| Overall status | Account management implemented; Cent profile launcher and batched user login started; verification pending |
+| Current step | 06 — Browser Profile Manager (first implementation slice) |
 | Completed steps | 4 of 55 |
 | Tested steps | 1 of 55 |
-| Current finding | Account category folders, single-category assignment, tag add/remove, single-row edit, and bulk edit/delete are implemented. The latest UI changes have not been tested. |
-| Next action | User to test per-row and bulk tag editing/removal, category moves, and Trash recovery in Cent. |
+| Current finding | Added a selected-account login batch dialog, Windows Cent launcher, post-batch status checklist, and a manual stale-profile reset after confirming Cent windows are closed. Login and 2FA remain user-driven. No Cent launch or UI tests have been run. |
+| Next action | Manually verify separate profiles, stale-status recovery, status recording, closing behavior, and batch progression in Cent. |
 | Last updated | 2026-10-06 |
 
 ## Architecture note for later steps
@@ -42,7 +42,7 @@ Current working assumption: Next.js runs locally on loopback and stores account 
 | 03 | Local Database Foundation | Completed | Not tested | Prisma 7 SQLite schema created; four migrations applied to local `data/kartstudio.db`; latest migration changes credential storage to a plain-text `password` field. DB is Git-ignored; server scripts bind to `127.0.0.1`. No account persistence tests run. | You will verify account persistence and password storage/reveal in Cent. |
 | 04 | Workspace & Application Settings | Not completed | Not tested | — | — |
 | 05 | Account Management UI | Completed | Not tested | Implemented CSV/TXT/XLSX import, selectable account table, per-row and bulk edit, reversible bulk delete, category folders with single-category moves and dropdown assignment, per-row/bulk tag replacement and clearing, notes editing, and downloadable examples. No app/UI tests run per user's preference to test locally. | User should test per-row and bulk tag editing/removal, category moves, and Trash recovery in Cent. |
-| 06 | Browser Profile Manager | Not completed | Not tested | — | — |
+| 06 | Browser Profile Manager | Not completed | Not tested | Added per-account profile directory creation and Cent launch through `--user-data-dir`; profile status and activity are recorded. Added post-batch session confirmation and a user-confirmed reset for stale OPEN/STARTING states. | Initial slice only: add profile listing/management and verify `--user-data-dir` against the installed Cent build. |
 | 07 | Browser Concurrency Engine | Not completed | Not tested | — | — |
 | 08 | Generic Automation Task Engine | Not completed | Not tested | — | — |
 | 09 | Automation Logging | Not completed | Not tested | — | — |
@@ -112,6 +112,9 @@ Current working assumption: Next.js runs locally on loopback and stores account 
 | 2026-10-07 | 05 | Added a selected-account Bulk edit modal for per-account name, category, and notes, plus Delete selected confirmation that moves accounts to Trash for recovery. Existing tag behavior is unchanged for the user's next step. | No app/UI tests run. | User to test bulk edit/delete in Cent; then address the tag behavior. |
 | 2026-10-07 | 05 | Made categories act as in-app account folders with per-folder counts and filtering, changed assignment from radio controls to a dropdown, and made category assignment move accounts into exactly one category. Fixed tag relation insertion by checking existing pairs before `createMany`, removing unsupported `skipDuplicates`. | Code updated; no app/UI tests run. | User to verify category folder membership and tag display in Cent. |
 | 2026-10-07 | 05 | Added category, comma-separated tags, and notes fields to single-row Edit; expanded Bulk edit with per-account tags. Saving these editors replaces the category/tag/note values, so clearing a field removes it. | No app/UI tests run. | User to verify editing and clearing values for one or multiple rows. |
+| 2026-10-07 | 06/10 | Added **Login selected** with a configurable batch size (1–20), isolated per-account Cent profile directories, visible Facebook login pages, and a manual “batch closed” checkpoint before continuing. Cent can be configured with `KARTSTUDIO_CENT_BROWSER_PATH`; common Windows install paths are also checked. Stored passwords are not injected and cookie import is not included. | No browser launch, build, or UI tests run. Cent profile-flag compatibility remains unverified on the user's installed version. | Configure Cent path if needed, then verify distinct profiles and batch behavior manually. Login completion/session detection remains future work. |
+| 2026-10-07 | 10 | Added a post-batch result checklist. The user marks which accounts signed in successfully; the app persists `Session.status`, `lastCheckedAt`, `lastAuthenticatedAt`, `Account.status`, and per-account activity records before advancing. | Code updated; no build or UI tests run. | Verify status changes and batch continuation manually in Cent. |
+| 2026-10-07 | 06 | Fixed recovery for profiles that remain marked OPEN after Cent is manually closed. The user can explicitly confirm the windows are closed, reset profile state, then retry; normal post-batch result saving also marks those profiles CLOSED. | Code updated; not run in Cent. | User to retry ACC-000005 and verify the old-profile state clears. |
 
 ## Per-step completion record
 
