@@ -1,10 +1,11 @@
-KartStudio is a Next.js App Router workspace for a browser automation product. The current build establishes the project foundation; feature modules will be added incrementally and tracked in `../kartstudio_progress_tracker.md`.
+KartStudio is a Next.js App Router workspace for a browser automation product. Its account store uses a SQLite file on this PC; the dev and production servers bind to `127.0.0.1` so the local account UI is not exposed to the LAN by default. Feature modules are added incrementally and tracked in `../kartstudio_progress_tracker.md`.
 
 ## Getting Started
 
 First, run the development server:
 
 ```bash
+npm run db:migrate -- --name account_foundation
 npm run dev
 # or
 yarn dev
@@ -17,6 +18,8 @@ bun dev
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
 The dashboard shell is in `app/page.tsx`. Shared styling is in `app/globals.css`. Route and root-level error boundaries are in `app/error.tsx` and `app/global-error.tsx`. Structured application logging helpers live in `lib/logger.ts`.
+
+The local database file is `data/kartstudio.db` and is ignored by Git. The Accounts screen imports CSV, TXT, and XLSX files with `mail` and `password` columns. Passwords are stored as plain text in this local SQLite database and are masked in the table until revealed with the per-account eye toggle. Use **Import accounts** to view and download example templates. Categories act as in-app account folders; each account can belong to one category at a time. Select account rows to bulk edit names, categories, tags, and notes, move them to Trash, append tags, or append notes. Use a row's **Edit** menu to edit or clear that account's category, tags, and notes. Prisma schema and migration files are under `prisma/`.
 
 Copy `.env.example` to `.env.local` when local configuration is needed. Keep secrets in server-only environment variables; never expose credentials through `NEXT_PUBLIC_*` variables.
 

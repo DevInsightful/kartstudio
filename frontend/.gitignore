@@ -16,6 +16,9 @@
 # next.js
 /.next/
 /out/
+/data/*.db
+/data/*.db-*
+/generated/prisma/
 
 # production
 /build

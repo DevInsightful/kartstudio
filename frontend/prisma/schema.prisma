@@ -1,0 +1,230 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Workspace {
+  id        String     @id @default(cuid())
+  name      String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  accounts  Account[]
+  categories Category[]
+  tags      Tag[]
+  operations BulkOperation[]
+  pages     Page[]
+  campaigns Campaign[]
+  content   Content[]
+  presets   ContentPreset[]
+  jobs      AutomationJob[]
+  activity  ActivityLog[]
+}
+
+model Account {
+  id           Int               @id @default(autoincrement())
+  workspaceId  String
+  displayName  String
+  platform     String            @default("FACEBOOK")
+  username     String?
+  platformUid  String?
+  profileUrl   String?
+  status       String            @default("NOT_CONFIGURED")
+  statusBeforeTrash String?
+  notes        String?
+  categoryId   String?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+  deletedAt    DateTime?
+  workspace    Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  category     Category?         @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  credentials  CredentialRecord?
+  browserProfile BrowserProfile?
+  session      Session?
+  tags         AccountTag[]
+  activity     ActivityLog[]
+  operationItems BulkOperationItem[]
+  pages        Page[]
+
+  @@unique([workspaceId, username])
+  @@unique([workspaceId, platform, platformUid])
+  @@index([workspaceId, deletedAt, displayName])
+  @@index([workspaceId, status])
+}
+
+model CredentialRecord {
+  id        String   @id @default(cuid())
+  accountId Int      @unique
+  username  String?
+  password  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+}
+
+model BrowserProfile {
+  id           String   @id @default(cuid())
+  accountId    Int      @unique
+  profilePath  String   @unique
+  status       String   @default("NOT_CREATED")
+  createdAt    DateTime @default(now())
+  lastStartedAt DateTime?
+  lastClosedAt DateTime?
+  account      Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+}
+
+model Session {
+  id                  String   @id @default(cuid())
+  accountId           Int      @unique
+  status              String   @default("UNKNOWN")
+  lastCheckedAt       DateTime?
+  lastAuthenticatedAt DateTime?
+  lastError           String?
+  account             Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+}
+
+model Category {
+  id          String    @id @default(cuid())
+  workspaceId String
+  name        String
+  description String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  accounts    Account[]
+
+  @@unique([workspaceId, name])
+}
+
+model Tag {
+  id          String       @id @default(cuid())
+  workspaceId String
+  name        String
+  createdAt   DateTime     @default(now())
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  accounts    AccountTag[]
+
+  @@unique([workspaceId, name])
+}
+
+model AccountTag {
+  accountId Int
+  tagId     String
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  tag       Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([accountId, tagId])
+}
+
+model ActivityLog {
+  id          String   @id @default(cuid())
+  workspaceId String
+  accountId   Int?
+  type        String
+  message     String
+  createdAt   DateTime @default(now())
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account     Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+  @@index([accountId, createdAt])
+}
+
+model BulkOperation {
+  id           String              @id @default(cuid())
+  workspaceId  String
+  type         String
+  status       String              @default("PENDING")
+  total        Int                 @default(0)
+  successCount Int                 @default(0)
+  failedCount  Int                 @default(0)
+  skippedCount Int                 @default(0)
+  createdAt    DateTime            @default(now())
+  completedAt  DateTime?
+  workspace    Workspace           @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  items        BulkOperationItem[]
+}
+
+model BulkOperationItem {
+  id              String        @id @default(cuid())
+  bulkOperationId String
+  accountId       Int?
+  status          String        @default("PENDING")
+  error           String?
+  createdAt       DateTime      @default(now())
+  completedAt     DateTime?
+  operation       BulkOperation @relation(fields: [bulkOperationId], references: [id], onDelete: Cascade)
+  account         Account?      @relation(fields: [accountId], references: [id], onDelete: SetNull)
+}
+
+model Page {
+  id          String    @id @default(cuid())
+  workspaceId String
+  accountId   Int?
+  campaignId  String?
+  name        String
+  bio         String?
+  status      String    @default("DRAFT")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account     Account?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  campaign    Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+}
+
+model Campaign {
+  id          String    @id @default(cuid())
+  workspaceId String
+  name        String
+  description String?
+  status      String    @default("ACTIVE")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  pages       Page[]
+  content     Content[]
+
+  @@unique([workspaceId, name])
+}
+
+model Content {
+  id          String    @id @default(cuid())
+  workspaceId String
+  campaignId  String?
+  title       String
+  sourcePath  String?
+  mediaType   String?
+  status      String    @default("READY")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  campaign    Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+}
+
+model ContentPreset {
+  id          String    @id @default(cuid())
+  workspaceId String
+  name        String
+  configJson  String    @default("{}")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, name])
+}
+
+model AutomationJob {
+  id          String    @id @default(cuid())
+  workspaceId String
+  type        String
+  status      String    @default("PENDING")
+  concurrency Int       @default(1)
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, status, createdAt])
+}
