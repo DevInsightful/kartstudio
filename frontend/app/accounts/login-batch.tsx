@@ -14,6 +14,7 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
   const [activeIds, setActiveIds] = useState<number[]>([]);
   const [reviewing, setReviewing] = useState(false);
   const [failed, setFailed] = useState<string[]>([]);
+  const [manualLoginIds, setManualLoginIds] = useState<number[]>([]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [isPending, startTransition] = useTransition();
@@ -24,11 +25,12 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
   function openBatch() {
     const batch = remaining.slice(0, batchSize);
     if (!batch.length) return;
-    setError(""); setNotice(""); setFailed([]); setAttemptedBatch(batch); setActiveBatch(batch); setReviewing(false); setActiveIds([]);
+    setError(""); setNotice(""); setFailed([]); setManualLoginIds([]); setAttemptedBatch(batch); setActiveBatch(batch); setReviewing(false); setActiveIds([]);
     startTransition(async () => {
       try {
         const result = await launchLoginBatch(batch.map(({ id }) => id));
         setFailed(result.failed);
+        setManualLoginIds(result.manualLoginIds);
         if (result.openedIds.length === 0) { setError("No browser profiles opened in this batch."); setActiveBatch([]); }
         else { setActiveBatch(batch.filter(({ id }) => result.openedIds.includes(id))); setActiveIds([]); }
       } catch (cause) {
@@ -77,8 +79,9 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
     </>}
     {isPending && <p className="account-inline-notice" role="status">Starting isolated Cent profiles…</p>}
     {activeBatch.length > 0 && !isPending && !reviewing && <>
-      <p className="account-inline-notice" role="status">Opened {activeBatch.length} profile(s). Complete login in Cent, then close every Cent window for this batch.</p>
+      <p className="account-inline-notice" role="status">Opened {activeBatch.length} profile(s). Saved credentials were submitted where available. Complete any Facebook checkpoint or 2FA prompt in Cent, then close every Cent window for this batch.</p>
       <ul className="login-batch-account-list">{activeBatch.map((account) => <li key={account.id}>{account.label}</li>)}</ul>
+      {manualLoginIds.length > 0 && <p className="account-alert error-alert" role="alert">Automatic sign-in needs attention for: {attemptedBatch.filter(({ id }) => manualLoginIds.includes(id)).map(({ label }) => label).join(", ")}. Finish sign-in manually in the corresponding Cent windows.</p>}
       <p className="login-batch-progress">Batch {batchNumber} of {batchCount}</p>
       <div className="modal-actions"><button type="button" className="secondary-button" onClick={onDone}>Close</button><button type="button" className="primary-button" onClick={() => setReviewing(true)}>Windows closed · record results</button></div>
     </>}

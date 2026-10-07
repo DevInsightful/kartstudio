@@ -5,11 +5,13 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { getLocalWorkspace, prisma } from "@/lib/prisma";
+import { submitFacebookLogin } from "@/lib/cent-login-automation";
 
 const MAX_BATCH_SIZE = 20;
 const FACEBOOK_LOGIN_URL = "https://www.facebook.com/login/";
 const PROFILE_ROOT = path.join(process.cwd(), "data", "browser-profiles");
-type LaunchResult = { openedIds: number[]; failed: string[] };
+type LaunchResult = { openedIds: number[]; failed: string[]; manualLoginIds: number[] };
+type LaunchOutcome = { error?: string; manualLogin?: boolean };
 
 function resolveCentPath() {
   const configured = process.env.KARTSTUDIO_CENT_BROWSER_PATH?.trim();
@@ -27,11 +29,18 @@ function profileDirectory(accountId: number) {
   return target;
 }
 
-async function launchOne(executable: string, accountId: number, workspaceId: string): Promise<string | null> {
+async function launchOne(
+  executable: string,
+  accountId: number,
+  workspaceId: string,
+  credentials: { username: string; password: string } | null,
+): Promise<LaunchOutcome> {
   const profilePath = profileDirectory(accountId);
   mkdirSync(profilePath, { recursive: true });
   const prior = await prisma.browserProfile.findUnique({ where: { accountId }, select: { status: true } });
-  if (prior?.status === "OPEN" || prior?.status === "STARTING") return "This account profile is already marked open. Close its Cent window before launching it again.";
+  if (prior?.status === "OPEN" || prior?.status === "STARTING") {
+    return { error: "This account profile is already marked open. Close its Cent window before launching it again." };
+  }
   await prisma.browserProfile.upsert({
     where: { accountId },
     update: { profilePath, status: "STARTING", lastStartedAt: new Date() },
@@ -39,7 +48,14 @@ async function launchOne(executable: string, accountId: number, workspaceId: str
   });
 
   return new Promise((resolve) => {
-    const child: ChildProcess = spawn(executable, [`--user-data-dir=${profilePath}`, "--no-first-run", "--new-window", FACEBOOK_LOGIN_URL], {
+    const child: ChildProcess = spawn(executable, [
+      `--user-data-dir=${profilePath}`,
+      "--remote-debugging-address=127.0.0.1",
+      "--remote-debugging-port=0",
+      "--no-first-run",
+      "--new-window",
+      FACEBOOK_LOGIN_URL,
+    ], {
       detached: false,
       stdio: "ignore",
       windowsHide: false,
@@ -52,11 +68,21 @@ async function launchOne(executable: string, accountId: number, workspaceId: str
       didSpawn = true;
       void prisma.browserProfile.update({ where: { accountId }, data: { status: "OPEN" } }).catch(() => undefined);
       void prisma.activityLog.create({ data: { workspaceId, accountId, type: "BROWSER_PROFILE_OPENED", message: "Dedicated Cent profile opened for user login." } }).catch(() => undefined);
-      resolve(null);
+      if (!credentials) {
+        resolve({ manualLogin: true });
+        return;
+      }
+      void submitFacebookLogin(profilePath, credentials).then(
+        () => resolve({}),
+        (error: unknown) => {
+          console.error(`[facebook-login] Automatic sign-in could not be completed for account ${accountId} (${error instanceof Error ? error.name : "UnknownError"}).`);
+          resolve({ manualLogin: true });
+        },
+      );
     });
     child.once("error", (error) => {
       void prisma.browserProfile.update({ where: { accountId }, data: { status: "ERROR" } }).catch(() => undefined);
-      if (!settled) { settled = true; resolve(error.message); }
+      if (!settled) { settled = true; resolve({ error: error.message }); }
     });
     child.once("close", () => {
       if (didSpawn) void prisma.browserProfile.update({ where: { accountId }, data: { status: "CLOSED", lastClosedAt: new Date() } }).catch(() => undefined);
@@ -73,20 +99,36 @@ export async function launchLoginBatch(ids: number[]): Promise<LaunchResult> {
   if (!executable) throw new Error("Cent Browser was not found. Set KARTSTUDIO_CENT_BROWSER_PATH in frontend/.env.local to the full path of Cent's chrome.exe, then restart the app.");
 
   const workspace = await getLocalWorkspace();
-  const accounts = await prisma.account.findMany({ where: { id: { in: ids }, workspaceId: workspace.id, deletedAt: null }, select: { id: true } });
+  const accounts = await prisma.account.findMany({
+    where: { id: { in: ids }, workspaceId: workspace.id, deletedAt: null },
+    select: { id: true, username: true, credentials: { select: { username: true, password: true } } },
+  });
   if (accounts.length !== ids.length) throw new Error("One or more selected accounts are unavailable. Refresh the account list and retry.");
   const orderedAccounts = [...accounts].sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
 
   const failed: string[] = [];
   const openedIds: number[] = [];
-  for (const account of orderedAccounts) {
+  const manualLoginIds: number[] = [];
+  const outcomes = await Promise.all(orderedAccounts.map(async (account) => {
     try {
-      const error = await launchOne(executable, account.id, workspace.id);
-      if (error) failed.push(`ACC-${String(account.id).padStart(6, "0")}: ${error}`);
-      else openedIds.push(account.id);
+      return { id: account.id, outcome: await launchOne(
+        executable,
+        account.id,
+        workspace.id,
+        account.credentials
+          ? { username: account.credentials.username ?? account.username ?? "", password: account.credentials.password }
+          : null,
+      ) };
     } catch (error) {
-      failed.push(`ACC-${String(account.id).padStart(6, "0")}: ${error instanceof Error ? error.message : "Could not create browser profile."}`);
+      return { id: account.id, outcome: { error: error instanceof Error ? error.message : "Could not create browser profile." } };
+    }
+  }));
+  for (const { id, outcome } of outcomes) {
+    if (outcome.error) failed.push(`ACC-${String(id).padStart(6, "0")}: ${outcome.error}`);
+    else {
+      openedIds.push(id);
+      if (outcome.manualLogin) manualLoginIds.push(id);
     }
   }
-  return { openedIds, failed };
+  return { openedIds, failed, manualLoginIds };
 }
