@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useTransition } from "react";
 import { launchLoginBatch } from "./login-actions";
-import { confirmProfilesClosed, recordLoginBatchResults } from "./session-actions";
+import { confirmProfilesClosed } from "./session-actions";
 
 type LoginAccount = { id: number; label: string };
 
@@ -11,10 +11,12 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
   const [position, setPosition] = useState(0);
   const [attemptedBatch, setAttemptedBatch] = useState<LoginAccount[]>([]);
   const [activeBatch, setActiveBatch] = useState<LoginAccount[]>([]);
-  const [activeIds, setActiveIds] = useState<number[]>([]);
-  const [reviewing, setReviewing] = useState(false);
   const [failed, setFailed] = useState<string[]>([]);
   const [manualLoginIds, setManualLoginIds] = useState<number[]>([]);
+  const [sessionReusedIds, setSessionReusedIds] = useState<number[]>([]);
+  const [authenticatedIds, setAuthenticatedIds] = useState<number[]>([]);
+  const [loginRequiredIds, setLoginRequiredIds] = useState<number[]>([]);
+  const [unverifiedIds, setUnverifiedIds] = useState<number[]>([]);
   const [populationErrors, setPopulationErrors] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -26,15 +28,19 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
   function openBatch() {
     const batch = remaining.slice(0, batchSize);
     if (!batch.length) return;
-    setError(""); setNotice(""); setFailed([]); setManualLoginIds([]); setPopulationErrors([]); setAttemptedBatch(batch); setActiveBatch(batch); setReviewing(false); setActiveIds([]);
+    setError(""); setNotice(""); setFailed([]); setManualLoginIds([]); setSessionReusedIds([]); setAuthenticatedIds([]); setLoginRequiredIds([]); setUnverifiedIds([]); setPopulationErrors([]); setAttemptedBatch(batch); setActiveBatch(batch);
     startTransition(async () => {
       try {
         const result = await launchLoginBatch(batch.map(({ id }) => id));
         setFailed(result.failed);
         setManualLoginIds(result.manualLoginIds);
+        setSessionReusedIds(result.sessionReusedIds);
+        setAuthenticatedIds(result.authenticatedIds);
+        setLoginRequiredIds(result.loginRequiredIds);
+        setUnverifiedIds(result.unverifiedIds);
         setPopulationErrors(result.populationErrors);
         if (result.openedIds.length === 0) { setError("No browser profiles opened in this batch."); setActiveBatch([]); }
-        else { setActiveBatch(batch.filter(({ id }) => result.openedIds.includes(id))); setActiveIds([]); }
+        else setActiveBatch(batch.filter(({ id }) => result.openedIds.includes(id)));
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : "Could not open the selected Cent profiles.");
         setActiveBatch([]);
@@ -42,15 +48,15 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
     });
   }
 
-  function saveBatchResults() {
+  function continueBatch() {
     const completedCount = attemptedBatch.length;
     startTransition(async () => {
       try {
-        await recordLoginBatchResults(attemptedBatch.map(({ id }) => id), activeIds);
+        await confirmProfilesClosed(attemptedBatch.map(({ id }) => id));
         setPosition((current) => Math.min(current + completedCount, accounts.length));
-        setActiveBatch([]); setAttemptedBatch([]); setActiveIds([]); setFailed([]); setError(""); setNotice(""); setReviewing(false);
+        setActiveBatch([]); setAttemptedBatch([]); setFailed([]); setError(""); setNotice("");
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "Could not save the login results.");
+        setError(cause instanceof Error ? cause.message : "Could not update the closed profile state.");
       }
     });
   }
@@ -74,26 +80,25 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
     <p className="eyebrow">{accounts.length} SELECTED</p>
     <h3 id="login-batch-title">Open Cent login profiles</h3>
     {!activeBatch.length && !finished && <>
-      <p className="login-batch-copy">Choose how many account profiles to open at a time. Cent windows will be restored and tiled evenly across your screen. You will sign in and complete any 2FA prompts in Cent.</p>
+      <p className="login-batch-copy">Choose how many account profiles to open at a time. Cent windows will be restored and tiled evenly. Facebook login state is checked and saved automatically; finish any checkpoint or 2FA prompt in Cent.</p>
       <label className="modal-field">Profiles per batch<input type="number" min={1} max={20} step={1} value={batchSize} disabled={position > 0} onChange={(event) => setBatchSize(Math.max(1, Math.min(20, Number(event.target.value) || 1)))} /></label>
       <div className="login-quick-select" aria-label="Quick select batch size">{[2, 4, 6, 8, 10, 12].map((size) => <button type="button" disabled={position > 0} className={batchSize === size ? "active" : ""} key={size} onClick={() => setBatchSize(size)}>{size}</button>)}</div>
       <p className="login-batch-progress">Batch {batchNumber} of {batchCount} · {remaining.length} account(s) remain.</p>
     </>}
-    {isPending && <p className="account-inline-notice" role="status">Step 1: opening all selected Cent profiles. Step 2: populating and submitting each profile&apos;s saved credentials one at a time…</p>}
-    {activeBatch.length > 0 && !isPending && !reviewing && <>
-      <p className="account-inline-notice" role="status">Opened and tiled {activeBatch.length} profile(s). Credentials were populated and the login form submitted where possible. Complete any Facebook checkpoint or 2FA prompt manually in Cent.</p>
+    {isPending && <p className="account-inline-notice" role="status">Opening selected Cent profiles, checking saved sessions, and submitting credentials only when Facebook requests sign-in…</p>}
+    {activeBatch.length > 0 && !isPending && <>
+      <p className="account-inline-notice" role="status">Facebook&apos;s page state was checked after each profile opened. Verified login results were saved automatically; complete any checkpoint or 2FA prompt manually in Cent.</p>
       <ul className="login-batch-account-list">{activeBatch.map((account) => <li key={account.id}>{account.label}</li>)}</ul>
+      {authenticatedIds.length > 0 && <p className="account-inline-notice" role="status">Login confirmed: {attemptedBatch.filter(({ id }) => authenticatedIds.includes(id)).map(({ label }) => label).join(", ")}.</p>}
+      {loginRequiredIds.length > 0 && <p className="account-alert error-alert" role="alert">Login still required: {attemptedBatch.filter(({ id }) => loginRequiredIds.includes(id)).map(({ label }) => label).join(", ")}. Complete any checkpoint or 2FA prompt in Cent.</p>}
+      {unverifiedIds.length > 0 && <p className="account-alert error-alert" role="alert">Could not verify login state: {attemptedBatch.filter(({ id }) => unverifiedIds.includes(id)).map(({ label }) => label).join(", ")}.</p>}
+      {sessionReusedIds.length > 0 && <p className="account-inline-notice" role="status">Reused saved browser sessions for: {attemptedBatch.filter(({ id }) => sessionReusedIds.includes(id)).map(({ label }) => label).join(", ")}.</p>}
       {manualLoginIds.length > 0 && <div className="account-alert error-alert" role="alert"><p>Automatic login could not be completed for: {attemptedBatch.filter(({ id }) => manualLoginIds.includes(id)).map(({ label }) => label).join(", ")}.</p><ul>{populationErrors.map((item) => <li key={item}>{item}</li>)}</ul></div>}
       <p className="login-batch-progress">Batch {batchNumber} of {batchCount}</p>
-      <div className="modal-actions"><button type="button" className="secondary-button" onClick={onDone}>Close</button><button type="button" className="primary-button" onClick={() => setReviewing(true)}>Windows closed · record results</button></div>
-    </>}
-    {activeBatch.length > 0 && !isPending && reviewing && <>
-      <p className="login-batch-copy">Select each account where you completed sign-in. Unchecked accounts will be recorded as Login required.</p>
-      <ul className="login-result-list">{attemptedBatch.map((account) => <li key={account.id}><label><input type="checkbox" checked={activeIds.includes(account.id)} onChange={(event) => setActiveIds((current) => event.target.checked ? [...current, account.id] : current.filter((id) => id !== account.id))} /> <span>{account.label}</span></label></li>)}</ul>
-      <div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setReviewing(false)}>Back</button><button type="button" className="primary-button" disabled={isPending} onClick={saveBatchResults}>{isPending ? "Saving…" : "Save results · continue"}</button></div>
+      <div className="modal-actions"><button type="button" className="secondary-button" onClick={onDone}>Close</button><button type="button" className="primary-button" disabled={isPending} onClick={continueBatch}>{isPending ? "Saving…" : "Profiles closed · continue"}</button></div>
     </>}
     {finished && !activeBatch.length && <>
-      <p className="account-inline-notice" role="status">All selected accounts have been opened in batches. Login completion is not detected by the app.</p>
+      <p className="account-inline-notice" role="status">All selected accounts have been checked. Verified Facebook login results were saved in the account list.</p>
       <div className="modal-actions"><button type="button" className="primary-button" onClick={onDone}>Done</button></div>
     </>}
     {failed.length > 0 && <div className="login-batch-errors" role="alert"><strong>Could not open:</strong><ul>{failed.map((item) => <li key={item}>{item}</li>)}</ul></div>}

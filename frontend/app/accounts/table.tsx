@@ -2,6 +2,7 @@
 import { useMemo, useState } from "react";
 import { addNotes, addTags, assignCategory, bulkTrashAccounts, bulkUpdateAccounts, renameAccount, restoreAccount, trashAccount } from "./actions";
 import LoginBatch from "./login-batch";
+import { launchLoginBatch } from "./login-actions";
 
 type Account = { id: number; code: string; displayName: string; username: string | null; category: string | null; categoryId: string | null; tags: string[]; notes: string | null; status: string; hasCredentials: boolean };
 type Category = { id: string; name: string };
@@ -14,6 +15,9 @@ export default function AccountsTable({ accounts, categories, trash }: { account
   const [revealed, setRevealed] = useState<{ id: number; password: string } | null>(null);
   const [revealingId, setRevealingId] = useState<number | null>(null); const [passwordError, setPasswordError] = useState("");
   const [editDrafts, setEditDrafts] = useState<EditDraft[]>([]);
+  const [openingProfileId, setOpeningProfileId] = useState<number | null>(null);
+  const [profileFeedback, setProfileFeedback] = useState("");
+  const [statusOverrides, setStatusOverrides] = useState<Record<number, string>>({});
   const ids = useMemo(() => accounts.map((account) => account.id), [accounts]);
   const allSelected = ids.length > 0 && ids.every((id) => selected.includes(id));
   function toggleAll() { setSelected(allSelected ? selected.filter((id) => !ids.includes(id)) : [...new Set([...selected, ...ids])]); }
@@ -40,18 +44,44 @@ export default function AccountsTable({ accounts, categories, trash }: { account
     } catch (error) { setPasswordError(error instanceof Error ? error.message : "Could not reveal password."); }
     finally { setRevealingId(null); }
   }
+  async function openProfile(id: number) {
+    setOpeningProfileId(id);
+    setProfileFeedback("");
+    try {
+      const result = await launchLoginBatch([id]);
+      if (!result.openedIds.includes(id)) {
+        setProfileFeedback(result.failed.join(" ") || "The Cent profile could not be opened.");
+        return;
+      }
+      if (result.authenticatedIds.includes(id)) {
+        setStatusOverrides((current) => ({ ...current, [id]: "ACTIVE" }));
+        setProfileFeedback("Facebook login confirmed for this profile.");
+      } else if (result.loginRequiredIds.includes(id)) {
+        setStatusOverrides((current) => ({ ...current, [id]: "LOGIN_REQUIRED" }));
+        setProfileFeedback("Facebook still requires sign-in. Complete any checkpoint or 2FA prompt in Cent.");
+      } else {
+        setStatusOverrides((current) => ({ ...current, [id]: "UNKNOWN" }));
+        setProfileFeedback(result.populationErrors.join(" ") || "The profile opened, but Facebook's login state could not be verified.");
+      }
+    } catch (error) {
+      setProfileFeedback(error instanceof Error ? error.message : "Could not open the Cent profile.");
+    } finally {
+      setOpeningProfileId(null);
+    }
+  }
   const action = modal === "category" ? assignCategory : modal === "tags" ? addTags : addNotes;
   return <>
     {!trash && <div className="account-selection-toolbar"><label><input type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="Select all accounts" /> Select all</label><span>{selected.length} selected</span><button type="button" disabled={!selected.length} onClick={openBulkEdit}>Bulk edit</button><button type="button" disabled={!selected.length} onClick={() => setModal("category")}>Add to categories</button><button type="button" disabled={!selected.length} onClick={() => setModal("tags")}>Add tags</button><button type="button" disabled={!selected.length} onClick={() => setModal("notes")}>Add notes</button><button type="button" disabled={!selected.length} onClick={() => setModal("login")}>Open login profiles</button><button type="button" className="bulk-delete-button" disabled={!selected.length} onClick={() => setModal("delete")}>Delete selected</button></div>}
     {feedback && <p className="account-inline-notice" role="status">{feedback}</p>}
+    {profileFeedback && <p className="account-inline-notice" role="status">{profileFeedback}</p>}
     {passwordError && <p className="account-alert error-alert" role="alert">{passwordError}</p>}
     <div className="account-table-wrap"><table className="account-table"><thead><tr>{!trash && <th aria-label="Select"><input type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="Select all accounts" /></th>}<th>Account</th>{!trash && <th>Password</th>}<th>Category</th><th>Tags</th><th>Notes</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>{accounts.map((account) => <tr key={account.id}>{!trash && <td><input type="checkbox" checked={selected.includes(account.id)} onChange={() => toggle(account.id)} aria-label={`Select ${account.username ?? account.displayName}`} /></td>}
         <td><div className="account-identity"><span className="account-avatar">{account.displayName.slice(0, 1).toUpperCase()}</span><span><strong>{account.displayName}</strong><small>{account.code} - {account.username ?? "No mail"}</small></span></div></td>
         {!trash && <td>{account.hasCredentials ? <div className="password-cell"><span>{revealed?.id === account.id ? revealed.password : "••••••••"}</span><button type="button" className="password-toggle" disabled={revealingId === account.id} onClick={() => void togglePassword(account.id)} aria-label={revealed?.id === account.id ? `Hide password for ${account.username ?? account.displayName}` : `Show password for ${account.username ?? account.displayName}`} title={revealed?.id === account.id ? "Hide password" : "Show password"}><svg viewBox="0 0 24 24" aria-hidden="true">{revealed?.id === account.id ? <><path d="M3 3l18 18"/><path d="M10.6 10.6a2 2 0 002.8 2.8"/><path d="M9.9 5.2A11.4 11.4 0 0112 5c5 0 8.5 4.5 9.5 7-.4 1-1.3 2.2-2.5 3.3M6.2 6.2C3.9 7.6 2.8 9.7 2.5 12c1 2.5 4.5 7 9.5 7 1.1 0 2.1-.2 3-.6"/></> : <><path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7z"/><circle cx="12" cy="12" r="3"/></>}</svg></button></div> : <span className="muted-cell">No credential</span>}</td>}
         <td>{account.category ?? <span className="muted-cell">Uncategorized</span>}</td><td><div className="account-tags">{account.tags.length ? account.tags.map((tag) => <span className="account-tag" key={tag}>{tag}</span>) : <span className="muted-cell">-</span>}</div></td>
-        <td className="account-note-cell" title={account.notes ?? ""}>{account.notes || <span className="muted-cell">-</span>}</td><td><span className={`account-status status-${account.status.toLowerCase()}`}>{account.status.replaceAll("_", " ")}</span></td>
-        <td>{trash ? <form action={restoreAccount}><input type="hidden" name="id" value={account.id} /><button className="text-action" type="submit">Restore</button></form> : <div className="row-actions"><details className="row-menu"><summary>Edit</summary><form action={renameAccount} className="account-edit-form"><input type="hidden" name="id" value={account.id} /><label>Account name<input name="displayName" defaultValue={account.displayName} required maxLength={120} /></label><label>Category<select name="categoryId" defaultValue={account.categoryId ?? ""}><option value="">No category</option>{categories.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Tags<input name="tags" defaultValue={account.tags.join(", ")} placeholder="Comma-separated tags" /></label><small>Remove a tag from the list or clear it to remove all tags.</small><label>Notes<textarea name="notes" defaultValue={account.notes ?? ""} rows={3} /></label><button className="primary-button" type="submit">Save changes</button></form></details><form action={trashAccount}><input type="hidden" name="id" value={account.id} /><button className="text-action danger-action" type="submit">Move to trash</button></form></div>}</td>
+        <td className="account-note-cell" title={account.notes ?? ""}>{account.notes || <span className="muted-cell">-</span>}</td><td><span className={`account-status status-${(statusOverrides[account.id] ?? account.status).toLowerCase()}`}>{(statusOverrides[account.id] ?? account.status).replaceAll("_", " ")}</span></td>
+        <td>{trash ? <form action={restoreAccount}><input type="hidden" name="id" value={account.id} /><button className="text-action" type="submit">Restore</button></form> : <div className="row-actions"><button className="text-action" type="button" disabled={openingProfileId !== null} onClick={() => void openProfile(account.id)}>{openingProfileId === account.id ? "Opening…" : (statusOverrides[account.id] ?? account.status) === "ACTIVE" ? "Open profile" : "Login"}</button><details className="row-menu"><summary>Edit</summary><form action={renameAccount} className="account-edit-form"><input type="hidden" name="id" value={account.id} /><label>Account name<input name="displayName" defaultValue={account.displayName} required maxLength={120} /></label><label>Category<select name="categoryId" defaultValue={account.categoryId ?? ""}><option value="">No category</option>{categories.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Tags<input name="tags" defaultValue={account.tags.join(", ")} placeholder="Comma-separated tags" /></label><small>Remove a tag from the list or clear it to remove all tags.</small><label>Notes<textarea name="notes" defaultValue={account.notes ?? ""} rows={3} /></label><button className="primary-button" type="submit">Save changes</button></form></details><form action={trashAccount}><input type="hidden" name="id" value={account.id} /><button className="text-action danger-action" type="submit">Move to trash</button></form></div>}</td>
       </tr>)}</tbody></table></div>
     {modal === "login" && <LoginBatch accounts={accounts.filter((account) => selected.includes(account.id)).map(({ id, username, displayName }) => ({ id, label: username ?? displayName }))} onDone={() => { setSelected([]); setModal(null); }} />}
     {modal && modal !== "login" && <div className="account-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeModal(); }}><section className="account-modal" role="dialog" aria-modal="true" aria-labelledby="bulk-modal-title"><button className="modal-close" type="button" onClick={closeModal} aria-label="Close">x</button><p className="eyebrow">{selected.length} SELECTED</p><h3 id="bulk-modal-title">{modal === "category" ? "Add to category" : modal === "tags" ? "Add tags" : modal === "notes" ? "Add notes" : modal === "edit" ? "Bulk edit accounts" : "Delete selected accounts"}</h3>

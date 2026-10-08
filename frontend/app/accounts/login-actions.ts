@@ -3,21 +3,27 @@
 import "server-only";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, statSync } from "node:fs";
+import { revalidatePath } from "next/cache";
 import path from "node:path";
 import { promisify } from "node:util";
 import { getLocalWorkspace, prisma } from "@/lib/prisma";
 import { populateAndSubmitFacebookLogin } from "@/lib/cent-login-automation";
 
 const MAX_BATCH_SIZE = 20;
-const FACEBOOK_LOGIN_URL = "https://www.facebook.com/login/";
+const FACEBOOK_HOME_URL = "https://www.facebook.com/";
 const PROFILE_ROOT = path.join(process.cwd(), "data", "browser-profiles");
 const execFileAsync = promisify(execFile);
 type LaunchResult = {
   openedIds: number[];
   failed: string[];
   manualLoginIds: number[];
+  sessionReusedIds: number[];
+  authenticatedIds: number[];
+  loginRequiredIds: number[];
+  unverifiedIds: number[];
   populationErrors: string[];
 };
+type LoginState = "authenticated" | "session-reused" | "login-required" | "unverified";
 type LaunchOutcome = { error?: string };
 type WindowBounds = { x: number; y: number; width: number; height: number };
 type WorkArea = WindowBounds;
@@ -97,7 +103,7 @@ async function launchOne(
       `--window-position=${bounds.x},${bounds.y}`,
       `--window-size=${bounds.width},${bounds.height}`,
       "--new-window",
-      FACEBOOK_LOGIN_URL,
+      FACEBOOK_HOME_URL,
     ], {
       detached: false,
       stdio: "ignore",
@@ -123,6 +129,45 @@ async function launchOne(
   });
 }
 
+async function persistLoginState(workspaceId: string, accountId: number, loginState: LoginState) {
+  const status = loginState === "authenticated" || loginState === "session-reused"
+    ? "ACTIVE"
+    : loginState === "login-required" ? "LOGIN_REQUIRED" : "UNKNOWN";
+  const now = new Date();
+  const lastError = status === "LOGIN_REQUIRED" ? "Facebook sign-in is still required." :
+    status === "UNKNOWN" ? "Facebook login state could not be verified." : null;
+  await prisma.$transaction(async (tx) => {
+    await tx.session.upsert({
+      where: { accountId },
+      update: {
+        status,
+        lastCheckedAt: now,
+        lastError,
+        ...(status === "ACTIVE" ? { lastAuthenticatedAt: now } : {}),
+      },
+      create: {
+        accountId,
+        status,
+        lastCheckedAt: now,
+        lastAuthenticatedAt: status === "ACTIVE" ? now : null,
+        lastError,
+      },
+    });
+    await tx.account.update({ where: { id: accountId }, data: { status } });
+    await tx.activityLog.create({
+      data: {
+        workspaceId,
+        accountId,
+        type: status === "ACTIVE" ? "LOGIN_CONFIRMED_AUTOMATICALLY" :
+          status === "LOGIN_REQUIRED" ? "LOGIN_REQUIRED_DETECTED" : "LOGIN_STATUS_UNVERIFIED",
+        message: status === "ACTIVE" ? "Facebook page state confirmed an authenticated session." :
+          status === "LOGIN_REQUIRED" ? "Facebook page state indicated sign-in is still required." :
+            "Facebook login state could not be verified.",
+      },
+    });
+  });
+}
+
 export async function launchLoginBatch(ids: number[]): Promise<LaunchResult> {
   if (process.platform !== "win32") throw new Error("Cent profile launching is currently supported on Windows only.");
   if (!Array.isArray(ids) || ids.length < 1 || ids.length > MAX_BATCH_SIZE || ids.some((id) => !Number.isSafeInteger(id) || id < 1) || new Set(ids).size !== ids.length) {
@@ -143,6 +188,10 @@ export async function launchLoginBatch(ids: number[]): Promise<LaunchResult> {
   const failed: string[] = [];
   const openedIds: number[] = [];
   const manualLoginIds: number[] = [];
+  const sessionReusedIds: number[] = [];
+  const authenticatedIds: number[] = [];
+  const loginRequiredIds: number[] = [];
+  const unverifiedIds: number[] = [];
   const populationErrors: string[] = [];
 
   // Open the full batch first; credential population runs only after this phase completes.
@@ -164,35 +213,35 @@ export async function launchLoginBatch(ids: number[]): Promise<LaunchResult> {
   // Only after every launch attempt, populate each successfully opened profile independently.
   for (const [index, account] of orderedAccounts.entries()) {
     if (!openedIds.includes(account.id)) continue;
-    if (!account.credentials) {
-      manualLoginIds.push(account.id);
-      populationErrors.push(`ACC-${String(account.id).padStart(6, "0")}: No imported credentials are available.`);
-      continue;
-    }
+    const credentials = account.credentials;
+    let loginResult: LoginState;
     try {
-      const submitted = await populateAndSubmitFacebookLogin(
+      loginResult = await populateAndSubmitFacebookLogin(
         profileDirectory(account.id),
-        {
-          username: account.credentials.username ?? account.username ?? "",
-          password: account.credentials.password,
-        },
+        credentials ? {
+          username: credentials.username ?? account.username ?? "",
+          password: credentials.password,
+        } : null,
         tileBounds(workArea, index, orderedAccounts.length),
       );
-      if (!submitted) {
-        manualLoginIds.push(account.id);
-        populationErrors.push(`ACC-${String(account.id).padStart(6, "0")}: Credentials were not submitted.`);
-      }
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Unknown error";
-      const safeReason = [account.credentials.username, account.username, account.credentials.password]
+      const safeReason = [credentials?.username, account.username, credentials?.password]
         .filter((value): value is string => Boolean(value))
         .reduce((message, secret) => message.split(secret).join("[redacted]"), reason)
         .slice(0, 240);
       console.error(`[facebook-login] Credentials could not be submitted for account ${account.id}: ${safeReason}`);
       manualLoginIds.push(account.id);
       populationErrors.push(`ACC-${String(account.id).padStart(6, "0")}: ${safeReason}`);
+      loginResult = "unverified";
     }
+    await persistLoginState(workspace.id, account.id, loginResult);
+    if (loginResult === "authenticated") authenticatedIds.push(account.id);
+    else if (loginResult === "session-reused") { authenticatedIds.push(account.id); sessionReusedIds.push(account.id); }
+    else if (loginResult === "login-required") loginRequiredIds.push(account.id);
+    else unverifiedIds.push(account.id);
   }
 
-  return { openedIds, failed, manualLoginIds, populationErrors };
+  revalidatePath("/accounts");
+  return { openedIds, failed, manualLoginIds, sessionReusedIds, authenticatedIds, loginRequiredIds, unverifiedIds, populationErrors };
 }

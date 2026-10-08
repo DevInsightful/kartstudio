@@ -23,11 +23,17 @@ type CdpResponse = {
 const DEBUG_PORT_FILE = "DevToolsActivePort";
 const TARGET_WAIT_MS = 30_000;
 const FORM_WAIT_MS = 30_000;
+const LOGIN_RESULT_WAIT_MS = 30_000;
 const COMMAND_WAIT_MS = 10_000;
 const execFileAsync = promisify(execFile);
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientExecutionContextError(error: unknown) {
+  const message = error instanceof Error ? error.message : "";
+  return /cannot find default execution context|execution context was destroyed|context with specified id not found|inspected target navigated or closed/i.test(message);
 }
 
 async function restoreCentWindow(profilePath: string, bounds: WindowBounds) {
@@ -188,7 +194,7 @@ export async function populateAndSubmitFacebookLogin(
   profilePath: string,
   credentials: Credentials | null,
   bounds: WindowBounds,
-): Promise<boolean> {
+): Promise<"authenticated" | "session-reused" | "login-required" | "unverified"> {
   const targetDeadline = Date.now() + TARGET_WAIT_MS;
   let target: DevToolsTarget | null = null;
   while (Date.now() < targetDeadline && !target) {
@@ -202,6 +208,8 @@ export async function populateAndSubmitFacebookLogin(
   const socket = await connect(target.webSocketDebuggerUrl);
   try {
     let commandId = 0;
+    await sendCommand(socket, ++commandId, "Page.enable", {});
+    await sendCommand(socket, ++commandId, "Runtime.enable", {});
     const windowResponse = await sendCommand(socket, ++commandId, "Browser.getWindowForTarget", {});
     const windowId = windowResponse.result?.windowId;
     if (typeof windowId !== "number") throw new Error("Cent did not provide a controllable browser window.");
@@ -209,15 +217,55 @@ export async function populateAndSubmitFacebookLogin(
       windowId,
       bounds: { ...bounds, windowState: "normal" },
     });
-    if (!credentials) {
-      await restoreCentWindow(profilePath, bounds);
-      return false;
-    }
-
-    const credentialLiteral = JSON.stringify(credentials);
     const formDeadline = Date.now() + FORM_WAIT_MS;
     let populated = false;
+    let sessionReused = false;
     while (Date.now() < formDeadline && !populated) {
+      let pageStateResponse: CdpResponse;
+      try {
+        pageStateResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+          expression: `(() => {
+            if (document.readyState !== "complete") return "loading";
+            if (/\\/checkpoint|\\/two_factor|\\/recover/i.test(location.pathname)) return "checkpoint";
+            const email = document.querySelector('input[name="email"], #email');
+            const password = document.querySelector('input[name="pass"], #pass');
+            if (email instanceof HTMLInputElement && password instanceof HTMLInputElement) return "login";
+            const loggedInMarker = document.querySelector(
+              'a[href="/me/"], [aria-label="Account"], [aria-label="Your profile"], [data-pagelet="ProfileTilesFeed_0"]'
+            );
+            return loggedInMarker ? "authenticated" : "loading";
+          })()`,
+          returnByValue: true,
+        });
+      } catch (error) {
+        if (!isTransientExecutionContextError(error)) throw error;
+        await delay(500);
+        continue;
+      }
+      if (pageStateResponse.result?.exceptionDetails) {
+        throw new Error("Facebook page state could not be checked.");
+      }
+      const pageState = pageStateResponse.result?.result?.value;
+      if (pageState === "authenticated") {
+        sessionReused = true;
+        break;
+      }
+      if (pageState === "checkpoint") {
+        await restoreCentWindow(profilePath, bounds);
+        return "login-required";
+      }
+      if (pageState !== "login") {
+        await delay(500);
+        continue;
+      }
+      if (!credentials) {
+        await restoreCentWindow(profilePath, bounds);
+        return "login-required";
+      }
+      if (!credentials.username || !credentials.password) {
+        throw new Error("This account does not have a complete username and password.");
+      }
+      const credentialLiteral = JSON.stringify(credentials);
       const fillExpression = `(() => {
         if (document.readyState !== "complete") return false;
         const email = document.querySelector('input[name="email"], #email');
@@ -242,11 +290,7 @@ export async function populateAndSubmitFacebookLogin(
           returnByValue: true,
         });
       } catch (error) {
-        const message = error instanceof Error ? error.message : "";
-        if (/cannot find default execution context|execution context was destroyed|context with specified id not found/i.test(message)) {
-          await delay(500);
-          continue;
-        }
+        if (isTransientExecutionContextError(error)) { await delay(500); continue; }
         throw error;
       }
       if (fillResponse.result?.exceptionDetails) {
@@ -255,7 +299,16 @@ export async function populateAndSubmitFacebookLogin(
       populated = fillResponse.result?.result?.value === true;
       if (!populated) await delay(300);
     }
+    if (sessionReused) {
+      try {
+        await restoreCentWindow(profilePath, bounds);
+      } catch (error) {
+        console.error(`[facebook-login] Profile window positioning failed while reusing its saved session (${error instanceof Error ? error.message : "Unknown error"}).`);
+      }
+      return "session-reused";
+    }
     if (!populated) throw new Error("Facebook's login form was not available.");
+    if (!credentials) throw new Error("No imported credentials are available for this login form.");
 
     const submitExpression = `(() => {
       if (location.hostname !== "facebook.com" && !location.hostname.endsWith(".facebook.com")) return false;
@@ -270,20 +323,89 @@ export async function populateAndSubmitFacebookLogin(
       email.form.requestSubmit(submit);
       return true;
     })()`;
-    const submitResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
-      expression: submitExpression,
-      returnByValue: true,
-    });
-    if (submitResponse.result?.exceptionDetails || submitResponse.result?.result?.value !== true) {
+    let submitWasAccepted = false;
+    try {
+      const submitResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+        expression: submitExpression,
+        returnByValue: true,
+      });
+      if (submitResponse.result?.exceptionDetails) {
+        throw new Error("Facebook's populated login form could not be submitted.");
+      }
+      submitWasAccepted = submitResponse.result?.result?.value === true;
+    } catch (error) {
+      if (!isTransientExecutionContextError(error)) throw error;
+      // Facebook may destroy the form's execution context immediately after navigation starts.
+      submitWasAccepted = true;
+    }
+    if (!submitWasAccepted) {
       throw new Error("Facebook's populated login form could not be submitted.");
     }
 
+    const resultDeadline = Date.now() + LOGIN_RESULT_WAIT_MS;
+    let loginFormSince: number | null = null;
+    while (Date.now() < resultDeadline) {
+      let response: CdpResponse;
+      try {
+        response = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+          expression: `(() => {
+            if (document.readyState !== "complete") return "loading";
+            if (/\\/checkpoint|\\/two_factor|\\/recover/i.test(location.pathname)) return "checkpoint";
+            const email = document.querySelector('input[name="email"], #email');
+            const password = document.querySelector('input[name="pass"], #pass');
+            if (email instanceof HTMLInputElement && password instanceof HTMLInputElement) return "login";
+            const loggedInMarker = document.querySelector(
+              'a[href="/me/"], [aria-label="Account"], [aria-label="Your profile"], [data-pagelet="ProfileTilesFeed_0"]'
+            );
+            return loggedInMarker ? "authenticated" : "loading";
+          })()`,
+          returnByValue: true,
+        });
+      } catch (error) {
+        if (isTransientExecutionContextError(error)) { await delay(500); continue; }
+        throw error;
+      }
+      if (response.result?.exceptionDetails) {
+        throw new Error("Facebook's post-submit page state could not be checked.");
+      }
+      const pageState = response.result?.result?.value;
+      if (pageState === "authenticated") {
+        try {
+          await restoreCentWindow(profilePath, bounds);
+        } catch (error) {
+          console.error(`[facebook-login] Profile window positioning failed after authentication (${error instanceof Error ? error.message : "Unknown error"}).`);
+        }
+        return "authenticated";
+      }
+      if (pageState === "checkpoint") {
+        try {
+          await restoreCentWindow(profilePath, bounds);
+        } catch (error) {
+          console.error(`[facebook-login] Profile window positioning failed at a Facebook checkpoint (${error instanceof Error ? error.message : "Unknown error"}).`);
+        }
+        return "login-required";
+      }
+      if (pageState === "login") {
+        loginFormSince ??= Date.now();
+        if (Date.now() - loginFormSince >= 6_000) {
+          try {
+            await restoreCentWindow(profilePath, bounds);
+          } catch (error) {
+            console.error(`[facebook-login] Profile window positioning failed after Facebook kept the login form open (${error instanceof Error ? error.message : "Unknown error"}).`);
+          }
+          return "login-required";
+        }
+      } else {
+        loginFormSince = null;
+      }
+      await delay(500);
+    }
     try {
       await restoreCentWindow(profilePath, bounds);
     } catch (error) {
-      console.error(`[facebook-login] Profile window positioning failed after form submission (${error instanceof Error ? error.message : "Unknown error"}).`);
+      console.error(`[facebook-login] Profile window positioning failed while awaiting Facebook's login result (${error instanceof Error ? error.message : "Unknown error"}).`);
     }
-    return true;
+    return "unverified";
   } finally {
     socket.close();
   }
