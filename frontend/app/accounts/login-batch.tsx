@@ -15,6 +15,7 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
   const [reviewing, setReviewing] = useState(false);
   const [failed, setFailed] = useState<string[]>([]);
   const [manualLoginIds, setManualLoginIds] = useState<number[]>([]);
+  const [populationErrors, setPopulationErrors] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [isPending, startTransition] = useTransition();
@@ -25,12 +26,13 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
   function openBatch() {
     const batch = remaining.slice(0, batchSize);
     if (!batch.length) return;
-    setError(""); setNotice(""); setFailed([]); setManualLoginIds([]); setAttemptedBatch(batch); setActiveBatch(batch); setReviewing(false); setActiveIds([]);
+    setError(""); setNotice(""); setFailed([]); setManualLoginIds([]); setPopulationErrors([]); setAttemptedBatch(batch); setActiveBatch(batch); setReviewing(false); setActiveIds([]);
     startTransition(async () => {
       try {
         const result = await launchLoginBatch(batch.map(({ id }) => id));
         setFailed(result.failed);
         setManualLoginIds(result.manualLoginIds);
+        setPopulationErrors(result.populationErrors);
         if (result.openedIds.length === 0) { setError("No browser profiles opened in this batch."); setActiveBatch([]); }
         else { setActiveBatch(batch.filter(({ id }) => result.openedIds.includes(id))); setActiveIds([]); }
       } catch (cause) {
@@ -72,16 +74,16 @@ export default function LoginBatch({ accounts, onDone }: { accounts: LoginAccoun
     <p className="eyebrow">{accounts.length} SELECTED</p>
     <h3 id="login-batch-title">Open Cent login profiles</h3>
     {!activeBatch.length && !finished && <>
-      <p className="login-batch-copy">Choose how many separate account profiles to open at a time. You will sign in and complete any 2FA prompts in Cent.</p>
+      <p className="login-batch-copy">Choose how many account profiles to open at a time. Cent windows will be restored and tiled evenly across your screen. You will sign in and complete any 2FA prompts in Cent.</p>
       <label className="modal-field">Profiles per batch<input type="number" min={1} max={20} step={1} value={batchSize} disabled={position > 0} onChange={(event) => setBatchSize(Math.max(1, Math.min(20, Number(event.target.value) || 1)))} /></label>
       <div className="login-quick-select" aria-label="Quick select batch size">{[2, 4, 6, 8, 10, 12].map((size) => <button type="button" disabled={position > 0} className={batchSize === size ? "active" : ""} key={size} onClick={() => setBatchSize(size)}>{size}</button>)}</div>
       <p className="login-batch-progress">Batch {batchNumber} of {batchCount} · {remaining.length} account(s) remain.</p>
     </>}
-    {isPending && <p className="account-inline-notice" role="status">Starting isolated Cent profiles…</p>}
+    {isPending && <p className="account-inline-notice" role="status">Step 1: opening all selected Cent profiles. Step 2: populating and submitting each profile&apos;s saved credentials one at a time…</p>}
     {activeBatch.length > 0 && !isPending && !reviewing && <>
-      <p className="account-inline-notice" role="status">Opened {activeBatch.length} profile(s). Saved credentials were submitted where available. Complete any Facebook checkpoint or 2FA prompt in Cent, then close every Cent window for this batch.</p>
+      <p className="account-inline-notice" role="status">Opened and tiled {activeBatch.length} profile(s). Credentials were populated and the login form submitted where possible. Complete any Facebook checkpoint or 2FA prompt manually in Cent.</p>
       <ul className="login-batch-account-list">{activeBatch.map((account) => <li key={account.id}>{account.label}</li>)}</ul>
-      {manualLoginIds.length > 0 && <p className="account-alert error-alert" role="alert">Automatic sign-in needs attention for: {attemptedBatch.filter(({ id }) => manualLoginIds.includes(id)).map(({ label }) => label).join(", ")}. Finish sign-in manually in the corresponding Cent windows.</p>}
+      {manualLoginIds.length > 0 && <div className="account-alert error-alert" role="alert"><p>Automatic login could not be completed for: {attemptedBatch.filter(({ id }) => manualLoginIds.includes(id)).map(({ label }) => label).join(", ")}.</p><ul>{populationErrors.map((item) => <li key={item}>{item}</li>)}</ul></div>}
       <p className="login-batch-progress">Batch {batchNumber} of {batchCount}</p>
       <div className="modal-actions"><button type="button" className="secondary-button" onClick={onDone}>Close</button><button type="button" className="primary-button" onClick={() => setReviewing(true)}>Windows closed · record results</button></div>
     </>}

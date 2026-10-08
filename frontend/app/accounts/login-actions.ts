@@ -1,17 +1,58 @@
 "use server";
 
 import "server-only";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import { getLocalWorkspace, prisma } from "@/lib/prisma";
-import { submitFacebookLogin } from "@/lib/cent-login-automation";
+import { populateAndSubmitFacebookLogin } from "@/lib/cent-login-automation";
 
 const MAX_BATCH_SIZE = 20;
 const FACEBOOK_LOGIN_URL = "https://www.facebook.com/login/";
 const PROFILE_ROOT = path.join(process.cwd(), "data", "browser-profiles");
-type LaunchResult = { openedIds: number[]; failed: string[]; manualLoginIds: number[] };
-type LaunchOutcome = { error?: string; manualLogin?: boolean };
+const execFileAsync = promisify(execFile);
+type LaunchResult = {
+  openedIds: number[];
+  failed: string[];
+  manualLoginIds: number[];
+  populationErrors: string[];
+};
+type LaunchOutcome = { error?: string };
+type WindowBounds = { x: number; y: number; width: number; height: number };
+type WorkArea = WindowBounds;
+
+async function getPrimaryWorkArea(): Promise<WorkArea> {
+  const script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; [PSCustomObject]@{x=$b.X;y=$b.Y;width=$b.Width;height=$b.Height} | ConvertTo-Json -Compress";
+  const { stdout } = await execFileAsync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-Command", script,
+  ], { windowsHide: true, timeout: 10_000, encoding: "utf8" });
+  const value: unknown = JSON.parse(stdout.trim());
+  if (!value || typeof value !== "object" || !("x" in value) || !("y" in value) ||
+      !("width" in value) || !("height" in value) ||
+      ![value.x, value.y, value.width, value.height].every(Number.isSafeInteger) ||
+      Number(value.width) < 320 || Number(value.height) < 240) {
+    throw new Error("Could not determine a usable Windows display area for the Cent profiles.");
+  }
+  return { x: Number(value.x), y: Number(value.y), width: Number(value.width), height: Number(value.height) };
+}
+
+function tileBounds(workArea: WorkArea, index: number, count: number): WindowBounds {
+  const columns = Math.ceil(Math.sqrt(count));
+  const rows = Math.ceil(count / columns);
+  const column = index % columns;
+  const row = Math.floor(index / columns);
+  const left = Math.floor(column * workArea.width / columns);
+  const top = Math.floor(row * workArea.height / rows);
+  const right = Math.floor((column + 1) * workArea.width / columns);
+  const bottom = Math.floor((row + 1) * workArea.height / rows);
+  return {
+    x: workArea.x + left,
+    y: workArea.y + top,
+    width: right - left,
+    height: bottom - top,
+  };
+}
 
 function resolveCentPath() {
   const configured = process.env.KARTSTUDIO_CENT_BROWSER_PATH?.trim();
@@ -33,7 +74,7 @@ async function launchOne(
   executable: string,
   accountId: number,
   workspaceId: string,
-  credentials: { username: string; password: string } | null,
+  bounds: WindowBounds,
 ): Promise<LaunchOutcome> {
   const profilePath = profileDirectory(accountId);
   mkdirSync(profilePath, { recursive: true });
@@ -53,6 +94,8 @@ async function launchOne(
       "--remote-debugging-address=127.0.0.1",
       "--remote-debugging-port=0",
       "--no-first-run",
+      `--window-position=${bounds.x},${bounds.y}`,
+      `--window-size=${bounds.width},${bounds.height}`,
       "--new-window",
       FACEBOOK_LOGIN_URL,
     ], {
@@ -68,17 +111,7 @@ async function launchOne(
       didSpawn = true;
       void prisma.browserProfile.update({ where: { accountId }, data: { status: "OPEN" } }).catch(() => undefined);
       void prisma.activityLog.create({ data: { workspaceId, accountId, type: "BROWSER_PROFILE_OPENED", message: "Dedicated Cent profile opened for user login." } }).catch(() => undefined);
-      if (!credentials) {
-        resolve({ manualLogin: true });
-        return;
-      }
-      void submitFacebookLogin(profilePath, credentials).then(
-        () => resolve({}),
-        (error: unknown) => {
-          console.error(`[facebook-login] Automatic sign-in could not be completed for account ${accountId} (${error instanceof Error ? error.name : "UnknownError"}).`);
-          resolve({ manualLogin: true });
-        },
-      );
+      resolve({});
     });
     child.once("error", (error) => {
       void prisma.browserProfile.update({ where: { accountId }, data: { status: "ERROR" } }).catch(() => undefined);
@@ -105,30 +138,61 @@ export async function launchLoginBatch(ids: number[]): Promise<LaunchResult> {
   });
   if (accounts.length !== ids.length) throw new Error("One or more selected accounts are unavailable. Refresh the account list and retry.");
   const orderedAccounts = [...accounts].sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+  const workArea = await getPrimaryWorkArea();
 
   const failed: string[] = [];
   const openedIds: number[] = [];
   const manualLoginIds: number[] = [];
-  const outcomes = await Promise.all(orderedAccounts.map(async (account) => {
+  const populationErrors: string[] = [];
+
+  // Open the full batch first; credential population runs only after this phase completes.
+  for (const [index, account] of orderedAccounts.entries()) {
     try {
-      return { id: account.id, outcome: await launchOne(
+      const outcome = await launchOne(
         executable,
         account.id,
         workspace.id,
-        account.credentials
-          ? { username: account.credentials.username ?? account.username ?? "", password: account.credentials.password }
-          : null,
-      ) };
+        tileBounds(workArea, index, orderedAccounts.length),
+      );
+      if (outcome.error) failed.push(`ACC-${String(account.id).padStart(6, "0")}: ${outcome.error}`);
+      else openedIds.push(account.id);
     } catch (error) {
-      return { id: account.id, outcome: { error: error instanceof Error ? error.message : "Could not create browser profile." } };
-    }
-  }));
-  for (const { id, outcome } of outcomes) {
-    if (outcome.error) failed.push(`ACC-${String(id).padStart(6, "0")}: ${outcome.error}`);
-    else {
-      openedIds.push(id);
-      if (outcome.manualLogin) manualLoginIds.push(id);
+      failed.push(`ACC-${String(account.id).padStart(6, "0")}: ${error instanceof Error ? error.message : "Could not create browser profile."}`);
     }
   }
-  return { openedIds, failed, manualLoginIds };
+
+  // Only after every launch attempt, populate each successfully opened profile independently.
+  for (const [index, account] of orderedAccounts.entries()) {
+    if (!openedIds.includes(account.id)) continue;
+    if (!account.credentials) {
+      manualLoginIds.push(account.id);
+      populationErrors.push(`ACC-${String(account.id).padStart(6, "0")}: No imported credentials are available.`);
+      continue;
+    }
+    try {
+      const submitted = await populateAndSubmitFacebookLogin(
+        profileDirectory(account.id),
+        {
+          username: account.credentials.username ?? account.username ?? "",
+          password: account.credentials.password,
+        },
+        tileBounds(workArea, index, orderedAccounts.length),
+      );
+      if (!submitted) {
+        manualLoginIds.push(account.id);
+        populationErrors.push(`ACC-${String(account.id).padStart(6, "0")}: Credentials were not submitted.`);
+      }
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Unknown error";
+      const safeReason = [account.credentials.username, account.username, account.credentials.password]
+        .filter((value): value is string => Boolean(value))
+        .reduce((message, secret) => message.split(secret).join("[redacted]"), reason)
+        .slice(0, 240);
+      console.error(`[facebook-login] Credentials could not be submitted for account ${account.id}: ${safeReason}`);
+      manualLoginIds.push(account.id);
+      populationErrors.push(`ACC-${String(account.id).padStart(6, "0")}: ${safeReason}`);
+    }
+  }
+
+  return { openedIds, failed, manualLoginIds, populationErrors };
 }

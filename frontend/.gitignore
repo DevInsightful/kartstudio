@@ -9,6 +9,8 @@
 !.yarn/plugins
 !.yarn/releases
 !.yarn/versions
+# Browser automation profiles / runtime browser data
+/frontend/data/browser-profiles/
 
 # testing
 /coverage

@@ -1,22 +1,101 @@
 import "server-only";
+import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import WebSocket from "ws";
 
 type Credentials = { username: string; password: string };
-type DevToolsTarget = { type?: string; url?: string; webSocketDebuggerUrl?: string };
+type WindowBounds = { x: number; y: number; width: number; height: number };
+type DevToolsTarget = { id?: string; type?: string; url?: string; webSocketDebuggerUrl?: string };
 type CdpResponse = {
   id?: number;
-  result?: { result?: { value?: unknown }; exceptionDetails?: unknown };
+  result?: {
+    result?: { value?: unknown };
+    windowId?: number;
+    nodeId?: number;
+    root?: { nodeId?: number };
+    exceptionDetails?: unknown;
+  };
   error?: { message?: string };
 };
 
 const DEBUG_PORT_FILE = "DevToolsActivePort";
 const TARGET_WAIT_MS = 30_000;
+const FORM_WAIT_MS = 30_000;
 const COMMAND_WAIT_MS = 10_000;
+const execFileAsync = promisify(execFile);
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function restoreCentWindow(profilePath: string, bounds: WindowBounds) {
+  const script = `
+$ErrorActionPreference = 'Stop'
+$profile = [Environment]::GetEnvironmentVariable('KARTSTUDIO_PROFILE_PATH')
+$deadline = [DateTime]::UtcNow.AddSeconds(10)
+$browserProcess = $null
+do {
+  $browserProcess = Get-CimInstance Win32_Process | Where-Object {
+    $_.CommandLine -and $_.CommandLine.Contains($profile) -and $_.CommandLine -notmatch '(?:^|\\s)--type='
+  } | Select-Object -First 1
+  if (-not $browserProcess) { Start-Sleep -Milliseconds 250 }
+} while (-not $browserProcess -and [DateTime]::UtcNow -lt $deadline)
+if (-not $browserProcess) { throw 'Could not find the Cent process for this account profile.' }
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class KartStudioWindowRestore {
+  private delegate bool EnumWindowsCallback(IntPtr hwnd, IntPtr parameter);
+  [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+  [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+  [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr hwnd);
+  [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+  [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr hwnd);
+  [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hwnd, int command);
+  [DllImport("user32.dll", SetLastError = true)] private static extern bool SetWindowPos(IntPtr hwnd, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+
+  public static bool RestoreTopmost(int processId, int x, int y, int width, int height) {
+    IntPtr match = IntPtr.Zero;
+    EnumWindows((hwnd, parameter) => {
+      uint ownerProcessId;
+      GetWindowThreadProcessId(hwnd, out ownerProcessId);
+      if (ownerProcessId == processId && IsWindowVisible(hwnd) && GetWindow(hwnd, 4) == IntPtr.Zero) {
+        match = hwnd;
+        return false;
+      }
+      return true;
+    }, IntPtr.Zero);
+    if (match == IntPtr.Zero) return false;
+    ShowWindow(match, 9);
+    if (!SetWindowPos(match, new IntPtr(-1), x, y, width, height, 0x10 | 0x20 | 0x40 | 0x200)) return false;
+    return !IsIconic(match);
+  }
+}
+'@
+$restored = [KartStudioWindowRestore]::RestoreTopmost(
+  [int]$browserProcess.ProcessId,
+  [int]$env:KARTSTUDIO_WINDOW_X,
+  [int]$env:KARTSTUDIO_WINDOW_Y,
+  [int]$env:KARTSTUDIO_WINDOW_WIDTH,
+  [int]$env:KARTSTUDIO_WINDOW_HEIGHT
+)
+if (-not $restored) { throw 'Cent did not expose a restorable window for this account profile.' }
+`;
+  await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    windowsHide: true,
+    timeout: 15_000,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      KARTSTUDIO_PROFILE_PATH: profilePath,
+      KARTSTUDIO_WINDOW_X: String(bounds.x),
+      KARTSTUDIO_WINDOW_Y: String(bounds.y),
+      KARTSTUDIO_WINDOW_WIDTH: String(bounds.width),
+      KARTSTUDIO_WINDOW_HEIGHT: String(bounds.height),
+    },
+  });
 }
 
 async function getFacebookTarget(profilePath: string): Promise<DevToolsTarget | null> {
@@ -105,10 +184,14 @@ function sendCommand(socket: WebSocket, id: number, method: string, params: Reco
   });
 }
 
-export async function submitFacebookLogin(profilePath: string, credentials: Credentials): Promise<void> {
-  const deadline = Date.now() + TARGET_WAIT_MS;
+export async function populateAndSubmitFacebookLogin(
+  profilePath: string,
+  credentials: Credentials | null,
+  bounds: WindowBounds,
+): Promise<boolean> {
+  const targetDeadline = Date.now() + TARGET_WAIT_MS;
   let target: DevToolsTarget | null = null;
-  while (Date.now() < deadline && !target) {
+  while (Date.now() < targetDeadline && !target) {
     target = await getFacebookTarget(profilePath);
     if (!target) await delay(300);
   }
@@ -118,46 +201,89 @@ export async function submitFacebookLogin(profilePath: string, credentials: Cred
 
   const socket = await connect(target.webSocketDebuggerUrl);
   try {
-    const credentialLiteral = JSON.stringify(credentials);
     let commandId = 0;
-    let coordinates: { x: number; y: number } | null = null;
-    while (Date.now() < deadline && !coordinates) {
-      const expression = `(() => {
+    const windowResponse = await sendCommand(socket, ++commandId, "Browser.getWindowForTarget", {});
+    const windowId = windowResponse.result?.windowId;
+    if (typeof windowId !== "number") throw new Error("Cent did not provide a controllable browser window.");
+    await sendCommand(socket, ++commandId, "Browser.setWindowBounds", {
+      windowId,
+      bounds: { ...bounds, windowState: "normal" },
+    });
+    if (!credentials) {
+      await restoreCentWindow(profilePath, bounds);
+      return false;
+    }
+
+    const credentialLiteral = JSON.stringify(credentials);
+    const formDeadline = Date.now() + FORM_WAIT_MS;
+    let populated = false;
+    while (Date.now() < formDeadline && !populated) {
+      const fillExpression = `(() => {
+        if (document.readyState !== "complete") return false;
         const email = document.querySelector('input[name="email"], #email');
         const password = document.querySelector('input[name="pass"], #pass');
-        const submit = email && password && (email.form?.querySelector('button[name="login"], input[name="login"], button[type="submit"], input[type="submit"]'));
-        if (!(email instanceof HTMLInputElement) || !(password instanceof HTMLInputElement) || !(submit instanceof HTMLElement)) return null;
-        const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
-        if (!setValue) return null;
+        if (!(email instanceof HTMLInputElement) || !(password instanceof HTMLInputElement) ||
+            !email.isConnected || !password.isConnected || email.disabled || password.disabled) return false;
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        if (!setter) return false;
         const values = ${credentialLiteral};
-        setValue.call(email, values.username);
+        setter.call(email, values.username);
         email.dispatchEvent(new Event("input", { bubbles: true }));
         email.dispatchEvent(new Event("change", { bubbles: true }));
-        setValue.call(password, values.password);
+        setter.call(password, values.password);
         password.dispatchEvent(new Event("input", { bubbles: true }));
         password.dispatchEvent(new Event("change", { bubbles: true }));
-        submit.scrollIntoView({ block: "center" });
-        const rect = submit.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0 ? { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 } : null;
+        return email.value === values.username && password.value === values.password;
       })()`;
-      const response = await sendCommand(socket, ++commandId, "Runtime.evaluate", { expression, returnByValue: true });
-      if (response.result?.exceptionDetails) throw new Error("Facebook's login form could not be prepared.");
-      const value = response.result?.result?.value;
-      if (value && typeof value === "object" && "x" in value && "y" in value &&
-          typeof value.x === "number" && typeof value.y === "number") {
-        coordinates = { x: value.x, y: value.y };
-      } else {
-        await delay(300);
+      let fillResponse: CdpResponse;
+      try {
+        fillResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+          expression: fillExpression,
+          returnByValue: true,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        if (/cannot find default execution context|execution context was destroyed|context with specified id not found/i.test(message)) {
+          await delay(500);
+          continue;
+        }
+        throw error;
       }
+      if (fillResponse.result?.exceptionDetails) {
+        throw new Error("Facebook rejected the credential population script.");
+      }
+      populated = fillResponse.result?.result?.value === true;
+      if (!populated) await delay(300);
     }
-    if (!coordinates) throw new Error("Facebook's login form was not available.");
+    if (!populated) throw new Error("Facebook's login form was not available.");
 
-    await sendCommand(socket, ++commandId, "Input.dispatchMouseEvent", {
-      type: "mousePressed", x: coordinates.x, y: coordinates.y, button: "left", clickCount: 1,
+    const submitExpression = `(() => {
+      if (location.hostname !== "facebook.com" && !location.hostname.endsWith(".facebook.com")) return false;
+      const email = document.querySelector('input[name="email"], #email');
+      const password = document.querySelector('input[name="pass"], #pass');
+      if (!(email instanceof HTMLInputElement) || !(password instanceof HTMLInputElement) ||
+          email.form !== password.form || !email.form ||
+          email.value !== ${JSON.stringify(credentials.username)} ||
+          password.value !== ${JSON.stringify(credentials.password)}) return false;
+      const submit = email.form.querySelector('button[name="login"], input[name="login"], button[type="submit"], input[type="submit"]');
+      if (!(submit instanceof HTMLButtonElement) && !(submit instanceof HTMLInputElement)) return false;
+      email.form.requestSubmit(submit);
+      return true;
+    })()`;
+    const submitResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+      expression: submitExpression,
+      returnByValue: true,
     });
-    await sendCommand(socket, ++commandId, "Input.dispatchMouseEvent", {
-      type: "mouseReleased", x: coordinates.x, y: coordinates.y, button: "left", clickCount: 1,
-    });
+    if (submitResponse.result?.exceptionDetails || submitResponse.result?.result?.value !== true) {
+      throw new Error("Facebook's populated login form could not be submitted.");
+    }
+
+    try {
+      await restoreCentWindow(profilePath, bounds);
+    } catch (error) {
+      console.error(`[facebook-login] Profile window positioning failed after form submission (${error instanceof Error ? error.message : "Unknown error"}).`);
+    }
+    return true;
   } finally {
     socket.close();
   }
