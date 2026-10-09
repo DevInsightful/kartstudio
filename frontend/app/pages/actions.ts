@@ -8,7 +8,7 @@ import { launchLoginBatch } from "@/app/accounts/login-actions";
 
 const PROFILE_ROOT = path.join(process.cwd(), "data", "browser-profiles");
 
-type PopulateResult = { state: "populated" | "login-required" | "checkpoint" | "category-unselected" | "unverified"; message: string };
+type PopulateResult = { state: "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "unverified"; message: string };
 
 export async function populatePageForm(
   accountId: number,
@@ -55,10 +55,10 @@ export async function populatePageForm(
     category: pageCategory,
     bio: pageBio,
   });
-  if (result === "populated") {
+  if (result === "created-clicked") {
     return {
       state: result,
-      message: "Page name, category, and bio were populated in Cent. Review them, add any images, and click Create yourself.",
+      message: "Facebook's Create Page button was clicked once after the name, bio, and category were verified. Check the Cent window for Facebook's response; the helper will not retry the click.",
     };
   }
   if (result === "login-required") {
@@ -71,6 +71,12 @@ export async function populatePageForm(
     return {
       state: result,
       message: "The Page name and bio were populated, but Facebook did not show an exact matching category suggestion. Select the category manually in Cent before continuing.",
+    };
+  }
+  if (result === "create-button-unavailable") {
+    return {
+      state: result,
+      message: "The name, bio, and category were populated, but an enabled Create Page button was not found. Review the form and submit manually in Cent.",
     };
   }
   return {

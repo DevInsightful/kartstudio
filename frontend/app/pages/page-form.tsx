@@ -21,7 +21,7 @@ export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
       try {
         const result = await populatePageForm(Number(accountId), name, category, bio);
         setMessage(result.message);
-        setIsError(result.state !== "populated");
+        setIsError(result.state !== "created-clicked");
       } catch (error) {
         setMessage(error instanceof Error ? error.message : "Could not populate the Facebook Page form.");
         setIsError(true);
@@ -31,8 +31,8 @@ export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
 
   return <section className="page-form-panel" aria-labelledby="page-form-title">
     <div className="page-form-heading">
-      <div><p className="eyebrow">SINGLE PAGE · MANUAL SUBMIT</p><h3 id="page-form-title">Populate Facebook Page form</h3>
-        <p>Select one active account and enter details for a single Page. The script fills the open Facebook form only; it will not create or submit a Page.</p></div>
+      <div><p className="eyebrow">SINGLE PAGE · TEST</p><h3 id="page-form-title">Create one Facebook Page</h3>
+        <p>Select one active account and enter details for a single Page. After verifying the populated fields and category selection, the helper clicks Create Page once.</p></div>
     </div>
     {accounts.length === 0 ? <p className="account-alert error-alert" role="status">No active accounts are available. Sign in to an account and verify its status in Accounts first.</p> : <>
       <label className="modal-field">Active Facebook account
@@ -50,8 +50,8 @@ export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
       <label className="modal-field">Bio
         <textarea value={bio} onChange={(event) => setBio(event.target.value)} maxLength={500} rows={4} required disabled={isPending} />
       </label>
-      <p className="page-form-note">The script selects the exact matching category suggestion when Facebook offers it. Add profile and cover images, complete any review steps, and verify all values manually in Cent before clicking Create.</p>
-      <div className="page-form-actions"><button className="primary-button" type="button" onClick={populate} disabled={isPending || !accountId || !name.trim() || !category.trim() || !bio.trim()}>{isPending ? "Opening and populating…" : "Open Facebook form and populate"}</button></div>
+      <p className="page-form-note">The helper selects the exact matching category suggestion before clicking Create Page. Facebook may require additional information or confirmation. It never retries an uncertain click; check the Cent window before running it again.</p>
+      <div className="page-form-actions"><button className="primary-button" type="button" onClick={populate} disabled={isPending || !accountId || !name.trim() || !category.trim() || !bio.trim()}>{isPending ? "Populating and creating…" : "Populate fields and click Create Page"}</button></div>
     </>}
     {message && <p className={`account-alert ${isError ? "error-alert" : "success-alert"}`} role={isError ? "alert" : "status"}>{message}</p>}
   </section>;
