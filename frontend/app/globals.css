@@ -95,6 +95,14 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -.03em; }
 .section-page { width: min(1120px, 100%); margin: 0 auto; }
 .section-intro { margin: 9px 0 24px; }
 .section-intro p:last-child { max-width: 650px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.page-form-panel { width: min(640px, 100%); padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: white; box-shadow: 0 5px 20px rgba(21, 43, 30, .04); }
+.page-form-heading h3 { margin: 0 0 7px; font-size: 15px; }
+.page-form-heading p:last-child, .page-form-note { margin: 0; color: #748078; font-size: 10px; line-height: 1.6; }
+.page-form-panel .modal-field { font-size: 10px; }
+.page-form-panel .modal-field input, .page-form-panel .modal-field textarea, .page-form-panel .modal-field select { font-size: 11px; }
+.page-form-note { margin-top: 12px; }
+.page-form-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
+.page-form-panel .account-alert { margin-top: 13px; }
 .empty-state { min-height: 300px; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 36px 20px; border: 1px dashed #d9e2dc; border-radius: 12px; background: rgba(255,255,255,.68); text-align: center; }
 .empty-state-mark { width: 40px; height: 40px; display: grid; place-items: center; margin-bottom: 14px; border: 1px solid #dce9e0; border-radius: 12px; background: #f3f8f4; color: var(--green); font-size: 21px; }
 .empty-state h2 { margin-bottom: 8px; font-size: 15px; letter-spacing: -.025em; }

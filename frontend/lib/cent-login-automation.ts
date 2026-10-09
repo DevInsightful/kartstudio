@@ -410,3 +410,202 @@ export async function populateAndSubmitFacebookLogin(
     socket.close();
   }
 }
+
+export async function populateFacebookPageForm(
+  profilePath: string,
+  details: { name: string; category: string; bio: string },
+): Promise<"populated" | "login-required" | "checkpoint" | "category-unselected" | "unverified"> {
+  const targetDeadline = Date.now() + TARGET_WAIT_MS;
+  let target: DevToolsTarget | null = null;
+  while (Date.now() < targetDeadline && !target) {
+    target = await getFacebookTarget(profilePath);
+    if (!target) await delay(300);
+  }
+  if (!target?.webSocketDebuggerUrl) {
+    throw new Error("Cent did not expose its local Facebook automation endpoint.");
+  }
+
+  const socket = await connect(target.webSocketDebuggerUrl);
+  try {
+    let commandId = 0;
+    await sendCommand(socket, ++commandId, "Page.enable", {});
+    await sendCommand(socket, ++commandId, "Runtime.enable", {});
+
+    const currentState = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+      expression: `(() => {
+        if (/\\/checkpoint|\\/two_factor|\\/recover/i.test(location.pathname)) return "checkpoint";
+        if (document.querySelector('input[name="email"], #email, input[name="pass"], #pass')) return "login";
+        const marker = document.querySelector(
+          'a[href="/me/"], [aria-label="Account"], [aria-label="Your profile"], [data-pagelet="ProfileTilesFeed_0"]'
+        );
+        return marker ? "authenticated" : "unknown";
+      })()`,
+      returnByValue: true,
+    });
+    if (currentState.result?.exceptionDetails) throw new Error("Facebook session state could not be checked.");
+    const state = currentState.result?.result?.value;
+    if (state === "checkpoint") return "checkpoint";
+    if (state === "login") return "login-required";
+    if (state !== "authenticated") return "unverified";
+
+    const navigation = await sendCommand(socket, ++commandId, "Page.navigate", {
+      url: "https://www.facebook.com/pages/creation/",
+    });
+    if (navigation.result?.exceptionDetails) throw new Error("Cent could not open Facebook's Page creation form.");
+
+    const fieldStateExpression = `(() => {
+      const visible = (element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden";
+      };
+      const controls = [...document.querySelectorAll('input:not([type="hidden"]):not([type="file"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')].filter(visible);
+      const fieldText = (element) => [
+        element.getAttribute("aria-label"),
+        element.getAttribute("placeholder"),
+        element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
+        element.closest("label")?.innerText,
+      ].filter(Boolean).join(" ").trim().toLowerCase();
+      const hasField = (pattern) => controls.some((element) => pattern.test(fieldText(element))) ||
+        [...document.querySelectorAll("label")].some((label) => visible(label) && pattern.test(label.innerText.trim().toLowerCase()) &&
+          (label.control || label.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')));
+      return hasField(/^page\\s*name(?:\\s*\\(required\\))?$/) &&
+        hasField(/^category(?:\\s*\\(required\\))?$/) &&
+        hasField(/^bio(?:\\s*\\(optional\\))?$/) ? "form" : "loading";
+    })()`;
+    const deadline = Date.now() + FORM_WAIT_MS;
+    while (Date.now() < deadline) {
+      let response: CdpResponse;
+      try {
+        response = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+          expression: `(() => {
+            if (/\\/checkpoint|\\/two_factor|\\/recover/i.test(location.pathname)) return "checkpoint";
+            if (document.querySelector('input[name="email"], #email, input[name="pass"], #pass')) return "login";
+            return (${fieldStateExpression}) === "form" ? "form" : "loading";
+          })()`,
+          returnByValue: true,
+        });
+      } catch (error) {
+        if (isTransientExecutionContextError(error)) { await delay(500); continue; }
+        throw error;
+      }
+      if (response.result?.exceptionDetails) throw new Error("Facebook Page form state could not be checked.");
+      const pageState = response.result?.result?.value;
+      if (pageState === "checkpoint") return "checkpoint";
+      if (pageState === "login") return "login-required";
+      if (pageState !== "form") { await delay(500); continue; }
+
+      const fillExpression = `(() => {
+        const values = ${JSON.stringify(details)};
+        const visible = (element) => {
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden";
+        };
+        const controls = [...document.querySelectorAll('input:not([type="hidden"]):not([type="file"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')].filter(visible);
+        const fieldText = (element) => [
+          element.getAttribute("aria-label"),
+          element.getAttribute("placeholder"),
+          element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
+          element.closest("label")?.innerText,
+        ].filter(Boolean).join(" ").trim().toLowerCase();
+        const findField = (pattern) => controls.find((element) => pattern.test(fieldText(element))) ??
+          [...document.querySelectorAll("label")].find((label) => visible(label) && pattern.test(label.innerText.trim().toLowerCase()))
+            ?.control ??
+          [...document.querySelectorAll("label")].find((label) => visible(label) && pattern.test(label.innerText.trim().toLowerCase()))
+            ?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
+        const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
+        const category = findField(/^category(?:\\s*\\(required\\))?$/);
+        const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
+        if (!name || !category || !bio) return false;
+        const setValue = (field, value) => {
+          if (field instanceof HTMLInputElement) {
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+            if (!setter) return false;
+            setter.call(field, value);
+          } else if (field instanceof HTMLTextAreaElement) {
+            const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+            if (!setter) return false;
+            setter.call(field, value);
+          } else if (field.isContentEditable) {
+            field.focus();
+            field.textContent = value;
+          } else {
+            return false;
+          }
+          field.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+          field.dispatchEvent(new Event("change", { bubbles: true }));
+          return true;
+        };
+        const readValue = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+          ? field.value
+          : field.textContent?.trim() ?? "";
+        if (!setValue(name, values.name) || !setValue(category, values.category) || !setValue(bio, values.bio)) return false;
+        return readValue(name) === values.name &&
+          readValue(category) === values.category &&
+          readValue(bio) === values.bio;
+      })()`;
+      let fillResponse: CdpResponse;
+      try {
+        fillResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+          expression: fillExpression,
+          returnByValue: true,
+        });
+      } catch (error) {
+        if (isTransientExecutionContextError(error)) { await delay(500); continue; }
+        throw error;
+      }
+      if (fillResponse.result?.exceptionDetails) throw new Error("Facebook Page form population script failed.");
+      if (fillResponse.result?.result?.value !== true) { await delay(500); continue; }
+
+      const categoryDeadline = Date.now() + 8_000;
+      while (Date.now() < categoryDeadline) {
+        let categoryResponse: CdpResponse;
+        try {
+          categoryResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+            expression: `(() => {
+              const expectedCategory = ${JSON.stringify(details.category.trim())};
+              const field = [...document.querySelectorAll('input, [role="combobox"], [aria-label]')]
+                .find((element) => {
+                  const rect = element.getBoundingClientRect();
+                  const label = [
+                    element.getAttribute("aria-label"),
+                    element.getAttribute("placeholder"),
+                    element.labels ? [...element.labels].map((item) => item.innerText).join(" ") : "",
+                    element.closest("label")?.innerText,
+                  ].filter(Boolean).join(" ").trim().toLowerCase();
+                  return rect.width > 0 && rect.height > 0 && /^category(?:\\s*\\(required\\))?$/.test(label);
+                });
+              if (!field) return "missing";
+              const options = [...document.querySelectorAll('[role="option"], [role="menuitem"], [role="listbox"] *, [role="dialog"] *')]
+                .filter((option) => {
+                  const rect = option.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0 &&
+                    option.textContent?.trim().toLowerCase() === expectedCategory.toLowerCase() &&
+                    ![...option.children].some((child) => child.textContent?.trim().toLowerCase() === expectedCategory.toLowerCase());
+                });
+              if (options.length) {
+                (options[0].closest('[role="option"], [role="menuitem"]') || options[0]).click();
+                return "selected";
+              }
+              const selected = field.getAttribute("aria-valuetext") || field.getAttribute("data-value") ||
+                field.parentElement?.querySelector('[role="option"][aria-selected="true"]')?.textContent;
+              return selected?.trim().toLowerCase() === expectedCategory.toLowerCase() ? "selected" : "waiting";
+            })()`,
+            returnByValue: true,
+          });
+        } catch (error) {
+          if (isTransientExecutionContextError(error)) { await delay(300); continue; }
+          throw error;
+        }
+        if (categoryResponse.result?.exceptionDetails) throw new Error("Facebook category suggestions could not be read.");
+        const categoryState = categoryResponse.result?.result?.value;
+        if (categoryState === "selected") return "populated";
+        if (categoryState === "missing") break;
+        await delay(300);
+      }
+      return "category-unselected";
+    }
+    return "unverified";
+  } finally {
+    socket.close();
+  }
+}
