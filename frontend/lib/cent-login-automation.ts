@@ -414,7 +414,7 @@ export async function populateAndSubmitFacebookLogin(
 export async function populateFacebookPageForm(
   profilePath: string,
   details: { name: string; category: string; bio: string },
-): Promise<"populated" | "login-required" | "checkpoint" | "category-unselected" | "unverified"> {
+): Promise<"created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "fields-unverified" | "category-unverified" | "unverified"> {
   const targetDeadline = Date.now() + TARGET_WAIT_MS;
   let target: DevToolsTarget | null = null;
   while (Date.now() < targetDeadline && !target) {
@@ -625,7 +625,263 @@ export async function populateFacebookPageForm(
               state: categoryResult.state,
             });
           }
-          if (categoryResult.state === "selected") return "populated";
+          if (categoryResult.state === "selected") {
+            const readyCheck = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+              expression: `(() => {
+                const expected = ${JSON.stringify(details)};
+                const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
+                  .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+                const visible = (element) => {
+                  const rect = element.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden" &&
+                    element.offsetParent !== null;
+                };
+                const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')].filter(visible);
+                const fieldText = (element) => [
+                  element.getAttribute("aria-label"),
+                  element.getAttribute("placeholder"),
+                  element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
+                  element.closest("label")?.innerText,
+                ].filter(Boolean).join(" ").trim().toLowerCase();
+                const findField = (pattern) => {
+                  const direct = fields.find((field) => pattern.test(fieldText(field)));
+                  if (direct) return direct;
+                  const label = [...document.querySelectorAll("label")].find((candidate) => visible(candidate) &&
+                    [...candidate.querySelectorAll("span")].some((span) =>
+                      pattern.test(span.innerText.trim().toLowerCase())));
+                  return label?.control ??
+                    label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
+                };
+                const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+                  ? field.value.trim()
+                  : field.textContent?.trim() || "";
+                const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
+                const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
+                const category = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
+                  .map((element) => element.innerText.trim());
+                if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio) {
+                  return {
+                    state: "fields-unverified",
+                    nameFound: Boolean(name),
+                    nameMatches: Boolean(name && valueOf(name) === expected.name),
+                    bioFound: Boolean(bio),
+                    bioMatches: Boolean(bio && valueOf(bio) === expected.bio),
+                  };
+                }
+                if (!category.some((value) => normalize(value).includes(normalize(expected.category)))) {
+                  return { state: "category-unverified", selectedCategories: category };
+                }
+                return { state: "ready" };
+              })()`,
+              returnByValue: true,
+            });
+            if (readyCheck.result?.exceptionDetails) throw new Error("Facebook Page details could not be verified before creation.");
+            const readyState = readyCheck.result?.result?.value;
+            if (!readyState || typeof readyState !== "object" || !("state" in readyState) || readyState.state !== "ready") {
+              if (process.env.NODE_ENV !== "production") {
+                console.warn("[page-create] Readiness verification failed", readyState);
+              }
+              if (readyState && typeof readyState === "object" && "state" in readyState &&
+                  (readyState.state === "fields-unverified" || readyState.state === "category-unverified")) {
+                return readyState.state;
+              }
+              throw new Error("Facebook Page details could not be verified before creation. The Create Page button was not clicked.");
+            }
+
+            await delay(2_000);
+
+            const clickExpression = `(() => {
+              const expected = ${JSON.stringify(details)};
+              const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
+                .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+              const visible = (element) => {
+                const rect = element.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 &&
+                  getComputedStyle(element).visibility !== "hidden" && element.offsetParent !== null;
+              };
+              const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')]
+                .filter(visible);
+              const fieldText = (element) => [
+                element.getAttribute("aria-label"),
+                element.getAttribute("placeholder"),
+                element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
+                element.closest("label")?.innerText,
+              ].filter(Boolean).join(" ").trim().toLowerCase();
+              const findField = (pattern) => {
+                const direct = fields.find((field) => pattern.test(fieldText(field)));
+                if (direct) return direct;
+                const label = [...document.querySelectorAll("label")].find((candidate) => visible(candidate) &&
+                  [...candidate.querySelectorAll("span")].some((span) =>
+                    pattern.test(span.innerText.trim().toLowerCase())));
+                return label?.control ??
+                  label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
+              };
+              const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+                ? field.value.trim()
+                : field.textContent?.trim() || "";
+              const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
+              const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
+              const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
+                .map((element) => element.innerText.trim());
+              if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
+                  !selected.some((value) => normalize(value).includes(normalize(expected.category)))) {
+                return { state: "fields-unverified" };
+              }
+
+              const target = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
+                .find(visible) ?? [...document.querySelectorAll("span")]
+                  .find((element) => element.innerText.trim() === "Create Page" && visible(element))
+                  ?.closest('[role="button"], a, button');
+              if (!target) return { state: "button-unavailable" };
+              if ((target instanceof HTMLButtonElement && target.disabled) || target.getAttribute("aria-disabled") === "true") {
+                return { state: "button-disabled" };
+              }
+              target.scrollIntoView({ block: "center" });
+              const rect = target.getBoundingClientRect();
+              if (!rect.width || !rect.height) return { state: "button-unavailable" };
+              return {
+                state: "clicked",
+                target: target.innerText?.trim() || target.getAttribute("aria-label"),
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2,
+              };
+            })()`;
+            const dispatchClick = async (): Promise<CdpResponse | null> => {
+              try {
+                return await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+                  expression: clickExpression,
+                  returnByValue: true,
+                });
+              } catch (error) {
+                if (isTransientExecutionContextError(error)) return null;
+                throw error;
+              }
+            };
+            const getClickState = (response: CdpResponse | null): string | undefined => {
+              if (!response) return undefined;
+              if (response.result?.exceptionDetails) throw new Error("Facebook Create Page click script failed.");
+              const value = response.result?.result?.value;
+              return value && typeof value === "object" && "state" in value && typeof value.state === "string"
+                ? value.state
+                : undefined;
+            };
+
+            const firstClick = await dispatchClick();
+            const firstState = getClickState(firstClick);
+            if (!firstClick) return "created-clicked";
+            if (firstState === "button-unavailable") return "create-button-unavailable";
+            if (firstState === "button-disabled") return "create-button-unavailable";
+            if (firstState === "fields-unverified") {
+              throw new Error("Facebook Page details changed before the Create Page click. The button was not clicked.");
+            }
+            if (firstState !== "clicked") throw new Error("Facebook Create Page click script returned an unexpected result.");
+            const firstClickValue = firstClick.result?.result?.value;
+            if (!firstClickValue || typeof firstClickValue !== "object" ||
+                !("x" in firstClickValue) || typeof firstClickValue.x !== "number" ||
+                !("y" in firstClickValue) || typeof firstClickValue.y !== "number") {
+              throw new Error("Could not determine the Create Page button position.");
+            }
+            const dispatchNativeClick = async (x: number, y: number) => {
+              await sendCommand(socket, ++commandId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+              await sendCommand(socket, ++commandId, "Input.dispatchMouseEvent", {
+                type: "mousePressed", x, y, button: "left", clickCount: 1,
+              });
+              await sendCommand(socket, ++commandId, "Input.dispatchMouseEvent", {
+                type: "mouseReleased", x, y, button: "left", clickCount: 1,
+              });
+            };
+            await dispatchNativeClick(firstClickValue.x, firstClickValue.y);
+            if (process.env.NODE_ENV !== "production") {
+              console.info("[page-create] Clicked the Create Page control with native browser input.", {
+                target: firstClickValue.target,
+              });
+            }
+
+            await delay(1_000);
+            let retryCheck: CdpResponse | null;
+            try {
+              retryCheck = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
+                expression: `(() => {
+                  const expected = ${JSON.stringify(details)};
+                  const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
+                    .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+                  const visible = (element) => {
+                    const rect = element.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden" &&
+                      element.offsetParent !== null;
+                  };
+                  const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')]
+                    .filter(visible);
+                  const fieldText = (element) => [
+                    element.getAttribute("aria-label"),
+                    element.getAttribute("placeholder"),
+                    element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
+                    element.closest("label")?.innerText,
+                  ].filter(Boolean).join(" ").trim().toLowerCase();
+                  const findField = (pattern) => {
+                    const direct = fields.find((field) => pattern.test(fieldText(field)));
+                    if (direct) return direct;
+                    const label = [...document.querySelectorAll("label")].find((candidate) => visible(candidate) &&
+                      [...candidate.querySelectorAll("span")].some((span) =>
+                        pattern.test(span.innerText.trim().toLowerCase())));
+                    return label?.control ??
+                      label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
+                  };
+                  const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+                    ? field.value.trim()
+                    : field.textContent?.trim() || "";
+                  const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
+                  const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
+                  const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
+                    .map((element) => element.innerText.trim());
+                  if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
+                      !selected.some((value) => normalize(value).includes(normalize(expected.category)))) {
+                    return { state: "fields-changed" };
+                  }
+                  const target = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
+                    .find(visible) ?? [...document.querySelectorAll("span")]
+                      .find((element) => element.innerText.trim() === "Create Page" && visible(element))
+                      ?.closest('[role="button"], a, button');
+                  if (!target) return { state: "gone" };
+                  if ((target instanceof HTMLButtonElement && target.disabled) || target.getAttribute("aria-disabled") === "true") {
+                    return { state: "disabled" };
+                  }
+                  target.scrollIntoView({ block: "center" });
+                  const rect = target.getBoundingClientRect();
+                  if (rect.width <= 0 || rect.height <= 0) return { state: "gone" };
+                  return { state: "visible", x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+                })()`,
+                returnByValue: true,
+              });
+            } catch (error) {
+              if (isTransientExecutionContextError(error)) return "created-clicked";
+              throw error;
+            }
+            if (retryCheck.result?.exceptionDetails) throw new Error("Could not verify Facebook's Create Page button after the first click.");
+            const retryState = retryCheck.result?.result?.value;
+            if (!retryState || typeof retryState !== "object" || !("state" in retryState) ||
+                retryState.state !== "visible") {
+              if (process.env.NODE_ENV !== "production") {
+                console.info("[page-create] First click changed or disabled the Create Page button; no retry needed.");
+              }
+              return "created-clicked";
+            }
+            if (!("x" in retryState) || typeof retryState.x !== "number" ||
+                !("y" in retryState) || typeof retryState.y !== "number") {
+              throw new Error("Could not determine the visible Create Page button position for the guarded retry.");
+            }
+
+            try {
+              await dispatchNativeClick(retryState.x, retryState.y);
+            } catch (error) {
+              if (isTransientExecutionContextError(error)) return "created-clicked";
+              throw error;
+            }
+            if (process.env.NODE_ENV !== "production") {
+              console.info("[page-create] Retried once with native browser input because Create Page remained visible and enabled.");
+            }
+            return "created-clicked";
+          }
           if (categoryResult.state === "missing") break;
         }
         await delay(300);

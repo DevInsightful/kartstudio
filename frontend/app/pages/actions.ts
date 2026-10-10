@@ -8,7 +8,7 @@ import { launchLoginBatch } from "@/app/accounts/login-actions";
 
 const PROFILE_ROOT = path.join(process.cwd(), "data", "browser-profiles");
 
-type PopulateResult = { state: "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "unverified"; message: string };
+type PopulateResult = { state: "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "fields-unverified" | "category-unverified" | "unverified"; message: string };
 
 export async function populatePageForm(
   accountId: number,
@@ -58,7 +58,7 @@ export async function populatePageForm(
   if (result === "created-clicked") {
     return {
       state: result,
-      message: "Facebook's Create Page button was clicked once after the name, bio, and category were verified. Check the Cent window for Facebook's response; the helper will not retry the click.",
+      message: "The Create Page click was sent after the name, bio, and category were verified. If the button remained visible and enabled after one second, the helper retried once using browser mouse input. Check the Cent window for Facebook's response.",
     };
   }
   if (result === "login-required") {
@@ -71,6 +71,18 @@ export async function populatePageForm(
     return {
       state: result,
       message: "The Page name and bio were populated, but Facebook did not show an exact matching category suggestion. Select the category manually in Cent before continuing.",
+    };
+  }
+  if (result === "fields-unverified") {
+    return {
+      state: result,
+      message: "Facebook did not expose the populated Page name or bio in a form field the helper could verify. The Create Page button was not clicked. Check the form in Cent and review the server log for which field failed verification.",
+    };
+  }
+  if (result === "category-unverified") {
+    return {
+      state: result,
+      message: "Facebook did not expose the chosen category as a selected category chip. The Create Page button was not clicked. Select the category from Facebook's suggestions in Cent and try again.",
     };
   }
   if (result === "create-button-unavailable") {

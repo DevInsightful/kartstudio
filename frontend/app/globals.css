@@ -100,6 +100,12 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -.03em; }
 .page-form-heading p:last-child, .page-form-note { margin: 0; color: #748078; font-size: 10px; line-height: 1.6; }
 .page-form-panel .modal-field { font-size: 10px; }
 .page-form-panel .modal-field input, .page-form-panel .modal-field textarea, .page-form-panel .modal-field select { font-size: 11px; }
+.page-category-field { position: relative; }
+.page-category-control { position: relative; }
+.page-category-options { position: absolute; z-index: 25; top: calc(100% + 4px); left: 0; right: 0; max-height: 220px; overflow-y: auto; margin: 0; padding: 4px; border: 1px solid #dfe7e1; border-radius: 8px; background: #fff; box-shadow: 0 10px 24px rgba(21, 43, 30, .14); list-style: none; }
+.page-category-options li button { display: block; width: 100%; padding: 8px 10px; border: 0; border-radius: 5px; background: transparent; color: var(--ink); text-align: left; font: inherit; font-size: 11px; cursor: pointer; }
+.page-category-options li.active button, .page-category-options li button:hover { background: #edf6f1; color: #17694c; }
+.page-category-options .page-category-empty { padding: 9px 10px; color: #87938b; font-size: 10px; }
 .page-form-note { margin-top: 12px; }
 .page-form-actions { display: flex; justify-content: flex-end; margin-top: 16px; }
 .page-form-panel .account-alert { margin-top: 13px; }
