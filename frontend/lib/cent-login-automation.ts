@@ -562,33 +562,50 @@ export async function populateFacebookPageForm(
         try {
           categoryResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
             expression: `(() => {
-              const expectedCategory = ${JSON.stringify(details.category.trim())};
-              const field = [...document.querySelectorAll('input, [role="combobox"], [aria-label]')]
-                .find((element) => {
-                  const rect = element.getBoundingClientRect();
-                  const label = [
-                    element.getAttribute("aria-label"),
-                    element.getAttribute("placeholder"),
-                    element.labels ? [...element.labels].map((item) => item.innerText).join(" ") : "",
-                    element.closest("label")?.innerText,
-                  ].filter(Boolean).join(" ").trim().toLowerCase();
-                  return rect.width > 0 && rect.height > 0 && /^category(?:\\s*\\(required\\))?$/.test(label);
-                });
-              if (!field) return "missing";
-              const options = [...document.querySelectorAll('[role="option"], [role="menuitem"], [role="listbox"] *, [role="dialog"] *')]
-                .filter((option) => {
-                  const rect = option.getBoundingClientRect();
-                  return rect.width > 0 && rect.height > 0 &&
-                    option.textContent?.trim().toLowerCase() === expectedCategory.toLowerCase() &&
-                    ![...option.children].some((child) => child.textContent?.trim().toLowerCase() === expectedCategory.toLowerCase());
-                });
-              if (options.length) {
-                (options[0].closest('[role="option"], [role="menuitem"]') || options[0]).click();
-                return "selected";
+              const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
+                .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+              const input = document.querySelector('input[aria-label="Category (required)"]');
+              if (!input) return { state: "missing" };
+              input.focus();
+              const requested = normalize(${JSON.stringify(details.category.trim())});
+              const query = normalize(input.value || ${JSON.stringify(details.category.trim())});
+              const selectedValues = () => [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
+                .map((element) => element.innerText.trim());
+              const existingSelection = selectedValues();
+              if (existingSelection.some((value) => normalize(value).includes(requested))) {
+                return { state: "selected", query, choices: [], target: existingSelection.find((value) => normalize(value).includes(requested)), selected: existingSelection };
               }
-              const selected = field.getAttribute("aria-valuetext") || field.getAttribute("data-value") ||
-                field.parentElement?.querySelector('[role="option"][aria-selected="true"]')?.textContent;
-              return selected?.trim().toLowerCase() === expectedCategory.toLowerCase() ? "selected" : "waiting";
+              const inputRect = input.getBoundingClientRect();
+              const visibleLeaves = [...document.querySelectorAll("div, span")].filter((element) => {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                if (!element.children.length || [...element.children].every((child) => !child.textContent?.trim())) {
+                  return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" &&
+                    rect.top >= inputRect.bottom - 4 && rect.top <= inputRect.bottom + 400 &&
+                    rect.left + rect.width / 2 >= inputRect.left - 60 &&
+                    rect.left + rect.width / 2 <= inputRect.right + 60 && element.innerText?.trim();
+                }
+                return false;
+              }).map((element) => ({
+                element,
+                text: element.innerText.trim(),
+                rect: element.getBoundingClientRect(),
+              }));
+              const matching = visibleLeaves.filter((option) => normalize(option.text).includes(query));
+              const choices = matching.length ? matching : visibleLeaves;
+              choices.sort((a, b) => a.rect.top - b.rect.top ||
+                (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+              const target = choices[0];
+              if (!target) return { state: "waiting", query, choices: [] };
+              target.element.click();
+              const selected = selectedValues();
+              return {
+                state: selected.some((value) => normalize(value).includes(requested)) ? "selected" : "clicked",
+                query,
+                choices: choices.map((option) => option.text),
+                target: target.text,
+                selected,
+              };
             })()`,
             returnByValue: true,
           });
@@ -597,9 +614,20 @@ export async function populateFacebookPageForm(
           throw error;
         }
         if (categoryResponse.result?.exceptionDetails) throw new Error("Facebook category suggestions could not be read.");
-        const categoryState = categoryResponse.result?.result?.value;
-        if (categoryState === "selected") return "populated";
-        if (categoryState === "missing") break;
+        const categoryResult = categoryResponse.result?.result?.value;
+        if (categoryResult && typeof categoryResult === "object" && "state" in categoryResult) {
+          if (process.env.NODE_ENV !== "production" && "query" in categoryResult) {
+            console.info("[page-create] Category suggestion selection", {
+              query: categoryResult.query,
+              choices: "choices" in categoryResult ? categoryResult.choices : [],
+              selected: "target" in categoryResult ? categoryResult.target : null,
+              chips: "selected" in categoryResult ? categoryResult.selected : [],
+              state: categoryResult.state,
+            });
+          }
+          if (categoryResult.state === "selected") return "populated";
+          if (categoryResult.state === "missing") break;
+        }
         await delay(300);
       }
       return "category-unselected";
