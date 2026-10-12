@@ -901,56 +901,63 @@ export async function populateFacebookPageForm(
       if (fillResponse.result?.result?.value !== true) { await delay(500); continue; }
 
       const categoryDeadline = Date.now() + 8_000;
+      let categoryClickSent = false;
       while (Date.now() < categoryDeadline) {
         let categoryResponse: CdpResponse;
         try {
           categoryResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
-            expression: `(() => {
-              const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
-                .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+            expression: `(async () => {
+              const normalize = (value) => (value || "").normalize("NFKD")
+                .replace(/[\\u0300-\\u036f]/g, "").toLowerCase()
+                .replace(/[^a-z0-9]+/g, " ").trim();
+              const hasCategory = (value, category) =>
+                (" " + normalize(value) + " ").includes(" " + category + " ");
               const input = document.querySelector('input[aria-label="Category (required)"]');
               if (!input) return { state: "missing" };
               input.focus();
-              const requested = normalize(${JSON.stringify(details.category.trim())});
-              const query = normalize(input.value || ${JSON.stringify(details.category.trim())});
+              const requestedCategory = ${JSON.stringify(details.category.trim())};
+              const requested = normalize(requestedCategory);
+              const query = input.value.trim();
               const selectedValues = () => [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
                 .map((element) => element.innerText.trim());
               const existingSelection = selectedValues();
-              if (existingSelection.some((value) => normalize(value).includes(requested))) {
-                return { state: "selected", query, choices: [], target: existingSelection.find((value) => normalize(value).includes(requested)), selected: existingSelection };
+              if (existingSelection.some((value) => hasCategory(value, requested))) {
+                return { state: "selected", query, choices: [], target: existingSelection.find((value) => hasCategory(value, requested)), selected: existingSelection };
               }
-              const inputRect = input.getBoundingClientRect();
-              const visibleLeaves = [...document.querySelectorAll("div, span")].filter((element) => {
-                const rect = element.getBoundingClientRect();
-                const style = getComputedStyle(element);
-                if (!element.children.length || [...element.children].every((child) => !child.textContent?.trim())) {
-                  return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none" &&
-                    rect.top >= inputRect.bottom - 4 && rect.top <= inputRect.bottom + 400 &&
-                    rect.left + rect.width / 2 >= inputRect.left - 60 &&
-                    rect.left + rect.width / 2 <= inputRect.right + 60 && element.innerText?.trim();
-                }
-                return false;
-              }).map((element) => ({
-                element,
-                text: element.innerText.trim(),
-                rect: element.getBoundingClientRect(),
-              }));
-              const matching = visibleLeaves.filter((option) => normalize(option.text).includes(query));
-              const choices = matching.length ? matching : visibleLeaves;
-              choices.sort((a, b) => a.rect.top - b.rect.top ||
-                (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
-              const target = choices[0];
-              if (!target) return { state: "waiting", query, choices: [] };
-              target.element.click();
+              if (${categoryClickSent}) return { state: "waiting", query, choices: [], selected: existingSelection };
+              await new Promise((resolve) => setTimeout(resolve, 300));
+              const candidates = [...document.querySelectorAll("div, span")]
+                .filter((element) =>
+                  element.children.length === 0 &&
+                  element.innerText?.trim() &&
+                  element.getClientRects().length > 0
+                );
+              const exactMatches = candidates.filter((element) => normalize(element.innerText.trim()) === requested);
+              const matches = exactMatches.length ? exactMatches : candidates.filter((element) =>
+                hasCategory(element.innerText.trim(), requested)
+              );
+              if (!matches.length) {
+                return { state: "waiting", query, choices: [] };
+              }
+              matches.sort((a, b) => {
+                const aRect = a.getBoundingClientRect();
+                const bRect = b.getBoundingClientRect();
+                return aRect.width * aRect.height - bRect.width * bRect.height;
+              });
+              const target = matches[0];
+              const targetText = target.innerText.trim();
+              target.click();
+              await new Promise((resolve) => setTimeout(resolve, 500));
               const selected = selectedValues();
               return {
-                state: selected.some((value) => normalize(value).includes(requested)) ? "selected" : "clicked",
+                state: selected.some((value) => hasCategory(value, requested)) ? "selected" : "clicked",
                 query,
-                choices: choices.map((option) => option.text),
-                target: target.text,
+                choices: matches.map((option) => option.innerText.trim()),
+                target: targetText,
                 selected,
               };
             })()`,
+            awaitPromise: true,
             returnByValue: true,
           });
         } catch (error) {
@@ -1044,6 +1051,10 @@ export async function populateFacebookPageForm(
             const imagesUploaded = await uploadPageImages(command, images);
             if (!imagesUploaded) return "image-upload-unavailable";
             return "images-uploaded";
+          }
+          if (categoryResult.state === "clicked") {
+            categoryClickSent = true;
+            await delay(500);
           }
           if (categoryResult.state === "missing") break;
         }
