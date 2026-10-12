@@ -1,6 +1,7 @@
 import "server-only";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import WebSocket from "ws";
@@ -14,10 +15,19 @@ type CdpResponse = {
     result?: { value?: unknown };
     windowId?: number;
     nodeId?: number;
+    nodeIds?: number[];
     root?: { nodeId?: number };
     exceptionDetails?: unknown;
   };
   error?: { message?: string };
+};
+type CdpCommand = (method: string, params: Record<string, unknown>) => Promise<CdpResponse>;
+type PageDetails = { name: string; category: string; bio: string };
+type PageImages = {
+  profileImage: Uint8Array;
+  profileImageType: string;
+  coverImage: Uint8Array;
+  coverImageType: string;
 };
 
 const DEBUG_PORT_FILE = "DevToolsActivePort";
@@ -184,10 +194,336 @@ function sendCommand(socket: WebSocket, id: number, method: string, params: Reco
     }
 
     socket.on("message", onMessage);
-    socket.send(JSON.stringify({ id, method, params }), (error) => {
-      if (error) finish(error);
-    });
+    if (socket.readyState !== WebSocket.OPEN) {
+      finish(new Error("Cent's automation connection closed before the browser command completed."));
+      return;
+    }
+    try {
+      socket.send(JSON.stringify({ id, method, params }), (error) => {
+        if (error) finish(error);
+      });
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error("Cent's browser command could not be sent."));
+    }
   });
+}
+
+async function evaluatePageScript(command: CdpCommand, expression: string) {
+  const response = await command("Runtime.evaluate", { expression, returnByValue: true });
+  if (response.result?.exceptionDetails) throw new Error("Facebook Page browser script failed.");
+  return response.result?.result?.value;
+}
+
+async function clickWithNativeInput(command: CdpCommand, x: number, y: number) {
+  await command("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+  await command("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x,
+    y,
+    button: "left",
+    clickCount: 1,
+  });
+  await command("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x,
+    y,
+    button: "left",
+    clickCount: 1,
+  });
+}
+
+async function clickCreatePageButton(command: CdpCommand, details: PageDetails) {
+  const clickExpression = `(() => {
+    const expected = ${JSON.stringify(details)};
+    const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
+      .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 &&
+        getComputedStyle(element).visibility !== "hidden" && element.offsetParent !== null;
+    };
+    const controls = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')]
+      .filter(visible);
+    const fieldText = (element) => [
+      element.getAttribute("aria-label"),
+      element.getAttribute("placeholder"),
+      element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
+      element.closest("label")?.innerText,
+    ].filter(Boolean).join(" ").trim().toLowerCase();
+    const findField = (pattern) => {
+      const direct = controls.find((field) => pattern.test(fieldText(field)));
+      if (direct) return direct;
+      const label = [...document.querySelectorAll("label")].find((candidate) => visible(candidate) &&
+        [...candidate.querySelectorAll("span")].some((span) =>
+          pattern.test(span.innerText.trim().toLowerCase())));
+      return label?.control ??
+        label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
+    };
+    const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+      ? field.value.trim()
+      : field.textContent?.trim() || "";
+    const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
+    const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
+    const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
+      .map((element) => element.innerText.trim());
+    if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
+        !selected.some((value) => normalize(value).includes(normalize(expected.category)))) {
+      return { state: "fields-unverified" };
+    }
+    const target = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
+      .find(visible) ?? [...document.querySelectorAll("span")]
+        .find((element) => element.innerText.trim() === "Create Page" && visible(element))
+        ?.closest('[role="button"], a, button');
+    if (!target) return { state: "button-unavailable" };
+    if ((target instanceof HTMLButtonElement && target.disabled) || target.getAttribute("aria-disabled") === "true") {
+      return { state: "button-disabled" };
+    }
+    target.scrollIntoView({ block: "center" });
+    const rect = target.getBoundingClientRect();
+    return { state: "ready", x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  })()`;
+  const first = await evaluatePageScript(command, clickExpression);
+  if (!first || typeof first !== "object" || !("state" in first)) {
+    throw new Error("Facebook Create Page click script returned an unexpected result.");
+  }
+  if (first.state === "fields-unverified") return "fields-unverified" as const;
+  if (first.state === "button-unavailable" || first.state === "button-disabled") {
+    return "button-unavailable" as const;
+  }
+  if (first.state !== "ready" || !("x" in first) || typeof first.x !== "number" ||
+      !("y" in first) || typeof first.y !== "number") {
+    throw new Error("Could not determine the Create Page button position.");
+  }
+
+  await clickWithNativeInput(command, first.x, first.y);
+  if (process.env.NODE_ENV !== "production") {
+    console.info("[page-create] Clicked the Create Page control with native browser input.");
+  }
+  await delay(1_000);
+
+  let retryState: unknown;
+  try {
+    retryState = await evaluatePageScript(command, `(() => {
+      const expected = ${JSON.stringify(details)};
+      const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
+        .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      const visible = (element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 &&
+          getComputedStyle(element).visibility !== "hidden" && element.offsetParent !== null;
+      };
+      const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')]
+        .filter(visible);
+      const fieldText = (element) => [
+        element.getAttribute("aria-label"),
+        element.getAttribute("placeholder"),
+        element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
+        element.closest("label")?.innerText,
+      ].filter(Boolean).join(" ").trim().toLowerCase();
+      const findField = (pattern) => {
+        const direct = fields.find((field) => pattern.test(fieldText(field)));
+        if (direct) return direct;
+        const label = [...document.querySelectorAll("label")].find((candidate) => visible(candidate) &&
+          [...candidate.querySelectorAll("span")].some((span) =>
+            pattern.test(span.innerText.trim().toLowerCase())));
+        return label?.control ??
+          label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
+      };
+      const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+        ? field.value.trim()
+        : field.textContent?.trim() || "";
+      const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
+      const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
+      const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
+        .map((element) => element.innerText.trim());
+      if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
+          !selected.some((value) => normalize(value).includes(normalize(expected.category)))) {
+        return { state: "fields-changed" };
+      }
+      const button = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
+        .find(visible);
+      if (!button || button.getAttribute("aria-disabled") === "true" ||
+          (button instanceof HTMLButtonElement && button.disabled)) return { state: "changed" };
+      button.scrollIntoView({ block: "center" });
+      const rect = button.getBoundingClientRect();
+      return { state: "visible", x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    })()`);
+  } catch (error) {
+    if (!isTransientExecutionContextError(error)) throw error;
+  }
+  if (retryState && typeof retryState === "object" && "state" in retryState &&
+      retryState.state === "visible" && "x" in retryState && typeof retryState.x === "number" &&
+      "y" in retryState && typeof retryState.y === "number") {
+    await clickWithNativeInput(command, retryState.x, retryState.y);
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[page-create] Retried Create Page once because the button remained visible and enabled.");
+    }
+  }
+  return "clicked" as const;
+}
+
+async function clickNextButton(command: CdpCommand) {
+  await delay(2_500);
+  const deadline = Date.now() + 7_000;
+  while (Date.now() < deadline) {
+    let state: unknown;
+    try {
+      state = await evaluatePageScript(command, `(() => {
+        const button = [...document.querySelectorAll('[role="button"][aria-label="Next"]')]
+          .find((element) => {
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 &&
+              getComputedStyle(element).visibility !== "hidden" &&
+              getComputedStyle(element).display !== "none" && element.offsetParent !== null;
+          });
+        if (!button || button.getAttribute("aria-disabled") === "true" ||
+            (button instanceof HTMLButtonElement && button.disabled)) return null;
+        button.scrollIntoView({ block: "center" });
+        const rect = button.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      })()`);
+    } catch (error) {
+      if (!isTransientExecutionContextError(error)) throw error;
+      await delay(400);
+      continue;
+    }
+    if (state && typeof state === "object" && "x" in state && typeof state.x === "number" &&
+        "y" in state && typeof state.y === "number") {
+      await clickWithNativeInput(command, state.x, state.y);
+      if (process.env.NODE_ENV !== "production") {
+        console.info("[page-create] Clicked Facebook's Next button with native browser input.");
+      }
+      return true;
+    }
+    await delay(400);
+  }
+  return false;
+}
+
+async function uploadPageImages(command: CdpCommand, images: PageImages) {
+  await command("DOM.enable", {});
+  const uploadDeadline = Date.now() + 10_000;
+  let profileInputIndex: number | undefined;
+  let coverInputIndex: number | undefined;
+  while (Date.now() < uploadDeadline) {
+    let inputStates: unknown;
+    try {
+      inputStates = await evaluatePageScript(command, `(() => [...document.querySelectorAll('input[type="file"][accept*="image"]')]
+        .map((input, index) => {
+          let container = input.parentElement;
+          for (let depth = 0; container && depth < 12; depth++, container = container.parentElement) {
+            const text = (container.innerText || "").toLowerCase();
+            if (text.includes("add profile picture")) return { index, kind: "profile" };
+            if (text.includes("add cover photo")) return { index, kind: "cover" };
+          }
+          return { index, kind: "unknown" };
+        }))()`);
+    } catch (error) {
+      if (!isTransientExecutionContextError(error)) throw error;
+      await delay(400);
+      continue;
+    }
+    if (Array.isArray(inputStates)) {
+      for (const inputState of inputStates) {
+        if (!inputState || typeof inputState !== "object" || !("index" in inputState) ||
+            typeof inputState.index !== "number" || !("kind" in inputState)) continue;
+        if (inputState.kind === "profile") profileInputIndex = inputState.index;
+        if (inputState.kind === "cover") coverInputIndex = inputState.index;
+      }
+    }
+    if (profileInputIndex !== undefined && coverInputIndex !== undefined &&
+        profileInputIndex !== coverInputIndex) break;
+    profileInputIndex = undefined;
+    coverInputIndex = undefined;
+    await delay(400);
+  }
+  if (profileInputIndex === undefined || coverInputIndex === undefined) return false;
+
+  const documentResponse = await command("DOM.getDocument", { depth: -1, pierce: true });
+  const rootNodeId = documentResponse.result?.root?.nodeId;
+  if (!rootNodeId) throw new Error("Facebook's image upload document could not be accessed.");
+  const inputResponse = await command("DOM.querySelectorAll", {
+    nodeId: rootNodeId,
+    selector: 'input[type="file"][accept*="image"]',
+  });
+  const inputNodeIds = inputResponse.result?.nodeIds;
+  if (!inputNodeIds || profileInputIndex >= inputNodeIds.length || coverInputIndex >= inputNodeIds.length) return false;
+
+  const extensions: Record<string, string> = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/bmp": "bmp",
+    "image/tiff": "tif",
+    "image/heic": "heic",
+    "image/heif": "heif",
+    "image/avif": "avif",
+  };
+  const profileExtension = extensions[images.profileImageType.toLowerCase()];
+  const coverExtension = extensions[images.coverImageType.toLowerCase()];
+  if (!profileExtension || !coverExtension) {
+    throw new Error("Use JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC, HEIF, or AVIF images for the profile and cover.");
+  }
+
+  const imageDirectory = await mkdtemp(path.join(os.tmpdir(), "kartstudio-page-images-"));
+  try {
+    const profileImagePath = path.join(imageDirectory, `profile.${profileExtension}`);
+    const coverImagePath = path.join(imageDirectory, `cover.${coverExtension}`);
+    await Promise.all([
+      writeFile(profileImagePath, images.profileImage, { flag: "wx" }),
+      writeFile(coverImagePath, images.coverImage, { flag: "wx" }),
+    ]);
+    await command("DOM.setFileInputFiles", {
+      nodeId: inputNodeIds[profileInputIndex],
+      files: [profileImagePath],
+    });
+    await command("DOM.setFileInputFiles", {
+      nodeId: inputNodeIds[coverInputIndex],
+      files: [coverImagePath],
+    });
+
+    const verificationDeadline = Date.now() + 5_000;
+    while (Date.now() < verificationDeadline) {
+      let attached: unknown;
+      try {
+        attached = await evaluatePageScript(command, `(() => {
+          const inputs = [...document.querySelectorAll('input[type="file"][accept*="image"]')];
+          const kindAt = (index) => {
+            let container = inputs[index]?.parentElement;
+            for (let depth = 0; container && depth < 12; depth++, container = container.parentElement) {
+              const text = (container.innerText || "").toLowerCase();
+              if (text.includes("add profile picture")) return "profile";
+              if (text.includes("add cover photo")) return "cover";
+            }
+            return "unknown";
+          };
+          const result = {};
+          inputs.forEach((input, index) => {
+            const kind = kindAt(index);
+            if (kind !== "unknown") result[kind] = input.files?.[0]?.name || "";
+          });
+          return result;
+        })()`);
+      } catch (error) {
+        if (!isTransientExecutionContextError(error)) throw error;
+        await delay(300);
+        continue;
+      }
+      if (attached && typeof attached === "object" &&
+          "profile" in attached && attached.profile === `profile.${profileExtension}` &&
+          "cover" in attached && attached.cover === `cover.${coverExtension}`) {
+        if (process.env.NODE_ENV !== "production") {
+          console.info("[page-create] Attached profile and cover images to Facebook's upload controls.");
+        }
+        return true;
+      }
+      await delay(300);
+    }
+    throw new Error("Facebook did not confirm both selected images. Check the Cent window before continuing.");
+  } finally {
+    await rm(imageDirectory, { recursive: true, force: true });
+  }
 }
 
 export async function populateAndSubmitFacebookLogin(
@@ -413,8 +749,9 @@ export async function populateAndSubmitFacebookLogin(
 
 export async function populateFacebookPageForm(
   profilePath: string,
-  details: { name: string; category: string; bio: string },
-): Promise<"created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "fields-unverified" | "category-unverified" | "unverified"> {
+  details: PageDetails,
+  images: PageImages,
+): Promise<"images-uploaded" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"> {
   const targetDeadline = Date.now() + TARGET_WAIT_MS;
   let target: DevToolsTarget | null = null;
   while (Date.now() < targetDeadline && !target) {
@@ -428,6 +765,7 @@ export async function populateFacebookPageForm(
   const socket = await connect(target.webSocketDebuggerUrl);
   try {
     let commandId = 0;
+    const command: CdpCommand = (method, params) => sendCommand(socket, ++commandId, method, params);
     await sendCommand(socket, ++commandId, "Page.enable", {});
     await sendCommand(socket, ++commandId, "Runtime.enable", {});
 
@@ -435,10 +773,7 @@ export async function populateFacebookPageForm(
       expression: `(() => {
         if (/\\/checkpoint|\\/two_factor|\\/recover/i.test(location.pathname)) return "checkpoint";
         if (document.querySelector('input[name="email"], #email, input[name="pass"], #pass')) return "login";
-        const marker = document.querySelector(
-          'a[href="/me/"], [aria-label="Account"], [aria-label="Your profile"], [data-pagelet="ProfileTilesFeed_0"]'
-        );
-        return marker ? "authenticated" : "unknown";
+        return "ready-to-navigate";
       })()`,
       returnByValue: true,
     });
@@ -446,7 +781,9 @@ export async function populateFacebookPageForm(
     const state = currentState.result?.result?.value;
     if (state === "checkpoint") return "checkpoint";
     if (state === "login") return "login-required";
-    if (state !== "authenticated") return "unverified";
+    if (state !== "ready-to-navigate") {
+      throw new Error("Facebook returned an unexpected session state before opening the Page form.");
+    }
 
     const navigation = await sendCommand(socket, ++commandId, "Page.navigate", {
       url: "https://www.facebook.com/pages/creation/",
@@ -465,8 +802,11 @@ export async function populateFacebookPageForm(
         element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
         element.closest("label")?.innerText,
       ].filter(Boolean).join(" ").trim().toLowerCase();
+      const labels = [...document.querySelectorAll("label")].filter((label) => visible(label));
+      const labelMatches = (label, pattern) => [...label.querySelectorAll("span")]
+        .some((span) => pattern.test(span.innerText.trim().toLowerCase()));
       const hasField = (pattern) => controls.some((element) => pattern.test(fieldText(element))) ||
-        [...document.querySelectorAll("label")].some((label) => visible(label) && pattern.test(label.innerText.trim().toLowerCase()) &&
+        labels.some((label) => labelMatches(label, pattern) &&
           (label.control || label.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')));
       return hasField(/^page\\s*name(?:\\s*\\(required\\))?$/) &&
         hasField(/^category(?:\\s*\\(required\\))?$/) &&
@@ -507,11 +847,15 @@ export async function populateFacebookPageForm(
           element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
           element.closest("label")?.innerText,
         ].filter(Boolean).join(" ").trim().toLowerCase();
-        const findField = (pattern) => controls.find((element) => pattern.test(fieldText(element))) ??
-          [...document.querySelectorAll("label")].find((label) => visible(label) && pattern.test(label.innerText.trim().toLowerCase()))
-            ?.control ??
-          [...document.querySelectorAll("label")].find((label) => visible(label) && pattern.test(label.innerText.trim().toLowerCase()))
-            ?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
+        const findField = (pattern) => {
+          const direct = controls.find((element) => pattern.test(fieldText(element)));
+          if (direct) return direct;
+          const label = [...document.querySelectorAll("label")].find((candidate) => visible(candidate) &&
+            [...candidate.querySelectorAll("span")].some((span) =>
+              pattern.test(span.innerText.trim().toLowerCase())));
+          return label?.control ??
+            label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
+        };
         const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
         const category = findField(/^category(?:\\s*\\(required\\))?$/);
         const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
@@ -690,197 +1034,16 @@ export async function populateFacebookPageForm(
 
             await delay(2_000);
 
-            const clickExpression = `(() => {
-              const expected = ${JSON.stringify(details)};
-              const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
-                .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-              const visible = (element) => {
-                const rect = element.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0 &&
-                  getComputedStyle(element).visibility !== "hidden" && element.offsetParent !== null;
-              };
-              const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')]
-                .filter(visible);
-              const fieldText = (element) => [
-                element.getAttribute("aria-label"),
-                element.getAttribute("placeholder"),
-                element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
-                element.closest("label")?.innerText,
-              ].filter(Boolean).join(" ").trim().toLowerCase();
-              const findField = (pattern) => {
-                const direct = fields.find((field) => pattern.test(fieldText(field)));
-                if (direct) return direct;
-                const label = [...document.querySelectorAll("label")].find((candidate) => visible(candidate) &&
-                  [...candidate.querySelectorAll("span")].some((span) =>
-                    pattern.test(span.innerText.trim().toLowerCase())));
-                return label?.control ??
-                  label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
-              };
-              const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
-                ? field.value.trim()
-                : field.textContent?.trim() || "";
-              const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
-              const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
-              const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
-                .map((element) => element.innerText.trim());
-              if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
-                  !selected.some((value) => normalize(value).includes(normalize(expected.category)))) {
-                return { state: "fields-unverified" };
-              }
+            const createResult = await clickCreatePageButton(command, details);
+            if (createResult === "fields-unverified") return "fields-unverified";
+            if (createResult !== "clicked") return "create-button-unavailable";
 
-              const target = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
-                .find(visible) ?? [...document.querySelectorAll("span")]
-                  .find((element) => element.innerText.trim() === "Create Page" && visible(element))
-                  ?.closest('[role="button"], a, button');
-              if (!target) return { state: "button-unavailable" };
-              if ((target instanceof HTMLButtonElement && target.disabled) || target.getAttribute("aria-disabled") === "true") {
-                return { state: "button-disabled" };
-              }
-              target.scrollIntoView({ block: "center" });
-              const rect = target.getBoundingClientRect();
-              if (!rect.width || !rect.height) return { state: "button-unavailable" };
-              return {
-                state: "clicked",
-                target: target.innerText?.trim() || target.getAttribute("aria-label"),
-                x: rect.left + rect.width / 2,
-                y: rect.top + rect.height / 2,
-              };
-            })()`;
-            const dispatchClick = async (): Promise<CdpResponse | null> => {
-              try {
-                return await sendCommand(socket, ++commandId, "Runtime.evaluate", {
-                  expression: clickExpression,
-                  returnByValue: true,
-                });
-              } catch (error) {
-                if (isTransientExecutionContextError(error)) return null;
-                throw error;
-              }
-            };
-            const getClickState = (response: CdpResponse | null): string | undefined => {
-              if (!response) return undefined;
-              if (response.result?.exceptionDetails) throw new Error("Facebook Create Page click script failed.");
-              const value = response.result?.result?.value;
-              return value && typeof value === "object" && "state" in value && typeof value.state === "string"
-                ? value.state
-                : undefined;
-            };
+            const nextClicked = await clickNextButton(command);
+            if (!nextClicked) return "next-button-unavailable";
 
-            const firstClick = await dispatchClick();
-            const firstState = getClickState(firstClick);
-            if (!firstClick) return "created-clicked";
-            if (firstState === "button-unavailable") return "create-button-unavailable";
-            if (firstState === "button-disabled") return "create-button-unavailable";
-            if (firstState === "fields-unverified") {
-              throw new Error("Facebook Page details changed before the Create Page click. The button was not clicked.");
-            }
-            if (firstState !== "clicked") throw new Error("Facebook Create Page click script returned an unexpected result.");
-            const firstClickValue = firstClick.result?.result?.value;
-            if (!firstClickValue || typeof firstClickValue !== "object" ||
-                !("x" in firstClickValue) || typeof firstClickValue.x !== "number" ||
-                !("y" in firstClickValue) || typeof firstClickValue.y !== "number") {
-              throw new Error("Could not determine the Create Page button position.");
-            }
-            const dispatchNativeClick = async (x: number, y: number) => {
-              await sendCommand(socket, ++commandId, "Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-              await sendCommand(socket, ++commandId, "Input.dispatchMouseEvent", {
-                type: "mousePressed", x, y, button: "left", clickCount: 1,
-              });
-              await sendCommand(socket, ++commandId, "Input.dispatchMouseEvent", {
-                type: "mouseReleased", x, y, button: "left", clickCount: 1,
-              });
-            };
-            await dispatchNativeClick(firstClickValue.x, firstClickValue.y);
-            if (process.env.NODE_ENV !== "production") {
-              console.info("[page-create] Clicked the Create Page control with native browser input.", {
-                target: firstClickValue.target,
-              });
-            }
-
-            await delay(1_000);
-            let retryCheck: CdpResponse | null;
-            try {
-              retryCheck = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
-                expression: `(() => {
-                  const expected = ${JSON.stringify(details)};
-                  const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
-                    .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-                  const visible = (element) => {
-                    const rect = element.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden" &&
-                      element.offsetParent !== null;
-                  };
-                  const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')]
-                    .filter(visible);
-                  const fieldText = (element) => [
-                    element.getAttribute("aria-label"),
-                    element.getAttribute("placeholder"),
-                    element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
-                    element.closest("label")?.innerText,
-                  ].filter(Boolean).join(" ").trim().toLowerCase();
-                  const findField = (pattern) => {
-                    const direct = fields.find((field) => pattern.test(fieldText(field)));
-                    if (direct) return direct;
-                    const label = [...document.querySelectorAll("label")].find((candidate) => visible(candidate) &&
-                      [...candidate.querySelectorAll("span")].some((span) =>
-                        pattern.test(span.innerText.trim().toLowerCase())));
-                    return label?.control ??
-                      label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
-                  };
-                  const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
-                    ? field.value.trim()
-                    : field.textContent?.trim() || "";
-                  const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
-                  const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
-                  const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
-                    .map((element) => element.innerText.trim());
-                  if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
-                      !selected.some((value) => normalize(value).includes(normalize(expected.category)))) {
-                    return { state: "fields-changed" };
-                  }
-                  const target = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
-                    .find(visible) ?? [...document.querySelectorAll("span")]
-                      .find((element) => element.innerText.trim() === "Create Page" && visible(element))
-                      ?.closest('[role="button"], a, button');
-                  if (!target) return { state: "gone" };
-                  if ((target instanceof HTMLButtonElement && target.disabled) || target.getAttribute("aria-disabled") === "true") {
-                    return { state: "disabled" };
-                  }
-                  target.scrollIntoView({ block: "center" });
-                  const rect = target.getBoundingClientRect();
-                  if (rect.width <= 0 || rect.height <= 0) return { state: "gone" };
-                  return { state: "visible", x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-                })()`,
-                returnByValue: true,
-              });
-            } catch (error) {
-              if (isTransientExecutionContextError(error)) return "created-clicked";
-              throw error;
-            }
-            if (retryCheck.result?.exceptionDetails) throw new Error("Could not verify Facebook's Create Page button after the first click.");
-            const retryState = retryCheck.result?.result?.value;
-            if (!retryState || typeof retryState !== "object" || !("state" in retryState) ||
-                retryState.state !== "visible") {
-              if (process.env.NODE_ENV !== "production") {
-                console.info("[page-create] First click changed or disabled the Create Page button; no retry needed.");
-              }
-              return "created-clicked";
-            }
-            if (!("x" in retryState) || typeof retryState.x !== "number" ||
-                !("y" in retryState) || typeof retryState.y !== "number") {
-              throw new Error("Could not determine the visible Create Page button position for the guarded retry.");
-            }
-
-            try {
-              await dispatchNativeClick(retryState.x, retryState.y);
-            } catch (error) {
-              if (isTransientExecutionContextError(error)) return "created-clicked";
-              throw error;
-            }
-            if (process.env.NODE_ENV !== "production") {
-              console.info("[page-create] Retried once with native browser input because Create Page remained visible and enabled.");
-            }
-            return "created-clicked";
+            const imagesUploaded = await uploadPageImages(command, images);
+            if (!imagesUploaded) return "image-upload-unavailable";
+            return "images-uploaded";
           }
           if (categoryResult.state === "missing") break;
         }
@@ -888,7 +1051,7 @@ export async function populateFacebookPageForm(
       }
       return "category-unselected";
     }
-    return "unverified";
+    return "form-unavailable";
   } finally {
     socket.close();
   }

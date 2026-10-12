@@ -7,19 +7,46 @@ import { populateFacebookPageForm } from "@/lib/cent-login-automation";
 import { launchLoginBatch } from "@/app/accounts/login-actions";
 
 const PROFILE_ROOT = path.join(process.cwd(), "data", "browser-profiles");
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/bmp",
+  "image/tiff",
+  "image/heic",
+  "image/heif",
+  "image/avif",
+]);
 
-type PopulateResult = { state: "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "fields-unverified" | "category-unverified" | "unverified"; message: string };
+type PopulateResult = { state: "images-uploaded" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"; message: string };
 
-export async function populatePageForm(
-  accountId: number,
-  name: string,
-  category: string,
-  bio: string,
-): Promise<PopulateResult> {
+export async function populatePageForm(formData: FormData): Promise<PopulateResult> {
+  const accountValue = formData.get("accountId");
+  const nameValue = formData.get("name");
+  const categoryValue = formData.get("category");
+  const bioValue = formData.get("bio");
+  const profileImage = formData.get("profileImage");
+  const coverImage = formData.get("coverImage");
+  if (typeof accountValue !== "string") throw new Error("Choose a valid Facebook account.");
+  if (typeof nameValue !== "string" || typeof categoryValue !== "string" || typeof bioValue !== "string") {
+    throw new Error("Enter a Page name, category, and bio.");
+  }
+  if (!(profileImage instanceof File) || profileImage.size === 0) throw new Error("Choose a profile picture.");
+  if (!(coverImage instanceof File) || coverImage.size === 0) throw new Error("Choose a cover photo.");
+  for (const [label, image] of [["Profile picture", profileImage], ["Cover photo", coverImage]] as const) {
+    if (!ALLOWED_IMAGE_TYPES.has(image.type.toLowerCase())) {
+      throw new Error(`${label} must be a JPEG, PNG, WebP, GIF, BMP, TIFF, HEIC, HEIF, or AVIF image.`);
+    }
+    if (image.size > MAX_IMAGE_SIZE) throw new Error(`${label} must be 10 MB or smaller.`);
+  }
+
+  const accountId = Number(accountValue);
   if (!Number.isSafeInteger(accountId) || accountId < 1) throw new Error("Choose a valid Facebook account.");
-  const pageName = name.trim();
-  const pageCategory = category.trim();
-  const pageBio = bio.trim();
+  const pageName = nameValue.trim();
+  const pageCategory = categoryValue.trim();
+  const pageBio = bioValue.trim();
   if (!pageName || pageName.length > 75) throw new Error("Enter a Page name between 1 and 75 characters.");
   if (!pageCategory || pageCategory.length > 100) throw new Error("Enter a Page category between 1 and 100 characters.");
   if (!pageBio || pageBio.length > 500) throw new Error("Enter a Page bio between 1 and 500 characters.");
@@ -54,11 +81,28 @@ export async function populatePageForm(
     name: pageName,
     category: pageCategory,
     bio: pageBio,
+  }, {
+    profileImage: new Uint8Array(await profileImage.arrayBuffer()),
+    profileImageType: profileImage.type,
+    coverImage: new Uint8Array(await coverImage.arrayBuffer()),
+    coverImageType: coverImage.type,
   });
+  if (result === "images-uploaded") {
+    return {
+      state: result,
+      message: "Facebook's profile picture and cover photo fields now have the selected images. Check Cent for Facebook's upload progress or any crop/confirmation prompts.",
+    };
+  }
+  if (result === "next-clicked") {
+    return {
+      state: result,
+      message: "Create Page was clicked. After Facebook displayed the follow-up screen, the helper waited 2.5 seconds and clicked Next once.",
+    };
+  }
   if (result === "created-clicked") {
     return {
       state: result,
-      message: "The Create Page click was sent after the name, bio, and category were verified. If the button remained visible and enabled after one second, the helper retried once using browser mouse input. Check the Cent window for Facebook's response.",
+      message: "The Create Page click was sent, but Facebook's Next button was not confirmed. Check the Cent window and continue manually if needed.",
     };
   }
   if (result === "login-required") {
@@ -91,8 +135,26 @@ export async function populatePageForm(
       message: "The name, bio, and category were populated, but an enabled Create Page button was not found. Review the form and submit manually in Cent.",
     };
   }
+  if (result === "next-button-unavailable") {
+    return {
+      state: result,
+      message: "Create Page was clicked, but Facebook's visible Next button did not appear within the wait period. Check the Cent window and continue manually if needed.",
+    };
+  }
+  if (result === "image-upload-unavailable") {
+    return {
+      state: result,
+      message: "Facebook's profile picture and cover upload controls did not appear after Next. The browser is open; add both images manually in Cent.",
+    };
+  }
+  if (result === "form-unavailable") {
+    return {
+      state: result,
+      message: "Facebook redirected away from the Page form or its required fields did not finish loading. Check the Cent tab for a login, checkpoint, or error screen and try again after resolving it.",
+    };
+  }
   return {
     state: result,
-    message: "The Facebook Page form or required fields were not recognized. The browser is open for you to continue manually.",
+    message: "Facebook returned an unexpected Page automation state. Check the Cent tab and server logs before continuing.",
   };
 }
