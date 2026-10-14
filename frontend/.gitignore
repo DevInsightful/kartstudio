@@ -11,6 +11,7 @@
 !.yarn/versions
 # Browser automation profiles / runtime browser data
 /frontend/data/browser-profiles/
+/data/browser-profiles/
 
 # testing
 /coverage

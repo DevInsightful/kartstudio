@@ -20,7 +20,7 @@ const ALLOWED_IMAGE_TYPES = new Set([
   "image/avif",
 ]);
 
-type PopulateResult = { state: "images-uploaded" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"; message: string };
+type PopulateResult = { state: "images-uploaded" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "post-upload-step-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"; message: string };
 
 export async function populatePageForm(formData: FormData): Promise<PopulateResult> {
   const accountValue = formData.get("accountId");
@@ -90,7 +90,7 @@ export async function populatePageForm(formData: FormData): Promise<PopulateResu
   if (result === "images-uploaded") {
     return {
       state: result,
-      message: "Facebook's profile picture and cover photo fields now have the selected images. Check Cent for Facebook's upload progress or any crop/confirmation prompts.",
+      message: "Facebook's profile and cover images were attached, then the Next → Skip → Next → Done sequence was completed. Check the Cent window for Facebook's final confirmation.",
     };
   }
   if (result === "next-clicked") {
@@ -114,7 +114,7 @@ export async function populatePageForm(formData: FormData): Promise<PopulateResu
   if (result === "category-unselected") {
     return {
       state: result,
-      message: "The Page name and bio were populated, but Facebook did not show an exact matching category suggestion. Select the category manually in Cent before continuing.",
+      message: "The Page name and bio were populated, but Facebook did not confirm a selected category chip. Select one of the visible suggestions manually in Cent before continuing.",
     };
   }
   if (result === "fields-unverified") {
@@ -145,6 +145,12 @@ export async function populatePageForm(formData: FormData): Promise<PopulateResu
     return {
       state: result,
       message: "Facebook's profile picture and cover upload controls did not appear after Next. The browser is open; add both images manually in Cent.",
+    };
+  }
+  if (result === "post-upload-step-unavailable") {
+    return {
+      state: result,
+      message: "The profile and cover images were attached, but Facebook did not show the next expected button in the Next → Skip → Next → Done sequence. Check Cent and continue manually from the current screen.",
     };
   }
   if (result === "form-unavailable") {

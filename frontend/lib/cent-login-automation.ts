@@ -265,9 +265,9 @@ async function clickCreatePageButton(command: CdpCommand, details: PageDetails) 
     const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
     const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
     const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
-      .map((element) => element.innerText.trim());
+      .map((element) => element.innerText.trim()).filter(Boolean);
     if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
-        !selected.some((value) => normalize(value).includes(normalize(expected.category)))) {
+        selected.length === 0) {
       return { state: "fields-unverified" };
     }
     const target = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
@@ -335,9 +335,9 @@ async function clickCreatePageButton(command: CdpCommand, details: PageDetails) 
       const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
       const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
       const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
-        .map((element) => element.innerText.trim());
+        .map((element) => element.innerText.trim()).filter(Boolean);
       if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
-          !selected.some((value) => normalize(value).includes(normalize(expected.category)))) {
+          selected.length === 0) {
         return { state: "fields-changed" };
       }
       const button = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
@@ -396,6 +396,52 @@ async function clickNextButton(command: CdpCommand) {
       return true;
     }
     await delay(400);
+  }
+  return false;
+}
+
+async function clickPageSetupButton(command: CdpCommand, label: string) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    let state: unknown;
+    try {
+      state = await evaluatePageScript(command, `(() => {
+        const expected = ${JSON.stringify(label)}.trim().toLowerCase();
+        const visible = (element) => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" &&
+            style.display !== "none" && element.getClientRects().length > 0;
+        };
+        const target = [...document.querySelectorAll('[role="button"], button, a')].find((element) => {
+          if (!visible(element)) return false;
+          const accessibleName = (element.getAttribute("aria-label") || element.innerText || "").trim().toLowerCase();
+          return accessibleName === expected;
+        }) ?? [...document.querySelectorAll("span, div")].find((element) =>
+          visible(element) && element.children.length === 0 &&
+          (element.innerText || "").trim().toLowerCase() === expected);
+        if (!target) return { state: "waiting" };
+        if (target.getAttribute("aria-disabled") === "true" ||
+            (target instanceof HTMLButtonElement && target.disabled)) return { state: "disabled" };
+        target.scrollIntoView({ block: "center" });
+        const rect = target.getBoundingClientRect();
+        return { state: "ready", x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      })()`);
+    } catch (error) {
+      if (!isTransientExecutionContextError(error)) throw error;
+      await delay(350);
+      continue;
+    }
+    if (state && typeof state === "object" && "state" in state && state.state === "ready" &&
+        "x" in state && typeof state.x === "number" && "y" in state && typeof state.y === "number") {
+      await clickWithNativeInput(command, state.x, state.y);
+      if (process.env.NODE_ENV !== "production") {
+        console.info(`[page-create] Clicked Facebook's ${label} button after image upload.`);
+      }
+      await delay(800);
+      return true;
+    }
+    await delay(350);
   }
   return false;
 }
@@ -751,7 +797,7 @@ export async function populateFacebookPageForm(
   profilePath: string,
   details: PageDetails,
   images: PageImages,
-): Promise<"images-uploaded" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"> {
+): Promise<"images-uploaded" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "post-upload-step-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"> {
   const targetDeadline = Date.now() + TARGET_WAIT_MS;
   let target: DevToolsTarget | null = null;
   while (Date.now() < targetDeadline && !target) {
@@ -813,6 +859,7 @@ export async function populateFacebookPageForm(
         hasField(/^bio(?:\\s*\\(optional\\))?$/) ? "form" : "loading";
     })()`;
     const deadline = Date.now() + FORM_WAIT_MS;
+    let categoryQueryWritten = false;
     while (Date.now() < deadline) {
       let response: CdpResponse;
       try {
@@ -834,6 +881,8 @@ export async function populateFacebookPageForm(
       if (pageState === "login") return "login-required";
       if (pageState !== "form") { await delay(500); continue; }
 
+      const writeCategoryThisPass = !categoryQueryWritten;
+      categoryQueryWritten = true;
       const fillExpression = `(() => {
         const values = ${JSON.stringify(details)};
         const visible = (element) => {
@@ -882,10 +931,19 @@ export async function populateFacebookPageForm(
         const readValue = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
           ? field.value
           : field.textContent?.trim() ?? "";
-        if (!setValue(name, values.name) || !setValue(category, values.category) || !setValue(bio, values.bio)) return false;
-        return readValue(name) === values.name &&
-          readValue(category) === values.category &&
-          readValue(bio) === values.bio;
+        if (readValue(name) !== values.name && !setValue(name, values.name)) return false;
+        if (readValue(bio) !== values.bio && !setValue(bio, values.bio)) return false;
+        const currentCategory = document.querySelector('input[aria-label="Category (required)"]') ?? category;
+        if (${writeCategoryThisPass} && readValue(currentCategory) !== values.category &&
+            !setValue(currentCategory, values.category)) return false;
+        const currentName = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
+        const currentBio = findField(/^bio(?:\\s*\\(optional\\))?$/);
+        const latestCategory = document.querySelector('input[aria-label="Category (required)"]') ??
+          findField(/^category(?:\\s*\\(required\\))?$/);
+        return Boolean(currentName && currentBio && latestCategory) &&
+          readValue(currentName) === values.name &&
+          readValue(latestCategory) === values.category &&
+          readValue(currentBio) === values.bio;
       })()`;
       let fillResponse: CdpResponse;
       try {
@@ -900,62 +958,164 @@ export async function populateFacebookPageForm(
       if (fillResponse.result?.exceptionDetails) throw new Error("Facebook Page form population script failed.");
       if (fillResponse.result?.result?.value !== true) { await delay(500); continue; }
 
+      const normalizeCategory = (value: string) => value.normalize("NFKD")
+        .replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      const expectedCategory = normalizeCategory(details.category);
+      let categorySelected = false;
+      for (let attempt = 1; attempt <= 3 && !categorySelected; attempt++) {
+        const field = await evaluatePageScript(command, `(() => {
+          const input = document.querySelector('input[aria-label^="Category"]');
+          if (!(input instanceof HTMLInputElement)) return null;
+          const rect = input.getBoundingClientRect();
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+        })()`);
+        if (!field || typeof field !== "object" || !("x" in field) || typeof field.x !== "number" ||
+            !("y" in field) || typeof field.y !== "number") {
+          await delay(300);
+          continue;
+        }
+
+        await clickWithNativeInput(command, field.x, field.y);
+        await command("Input.dispatchKeyEvent", {
+          type: "keyDown", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65,
+        });
+        await command("Input.dispatchKeyEvent", {
+          type: "keyUp", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65,
+        });
+        await command("Input.insertText", { text: details.category });
+        await delay(750);
+
+        const suggestions = await evaluatePageScript(command, `(() => {
+          const input = document.querySelector('input[aria-label^="Category"]');
+          if (!(input instanceof HTMLInputElement)) return { options: [], active: "", expanded: false };
+          const listboxId = input.getAttribute("aria-controls");
+          const listbox = (listboxId && document.getElementById(listboxId)) || document.querySelector('[role="listbox"]');
+          const visible = (option) => {
+            const rect = option.getBoundingClientRect();
+            const style = getComputedStyle(option);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" &&
+              style.display !== "none" && option.getClientRects().length > 0;
+          };
+          const options = [...(listbox?.querySelectorAll('[role="option"]') ?? [])]
+            .filter(visible).map((option) => ({ text: option.innerText.trim(), id: option.id }));
+          const activeId = input.getAttribute("aria-activedescendant");
+          const activeOption = activeId ? document.getElementById(activeId) :
+            listbox?.querySelector('[role="option"][aria-selected="true"]');
+          return {
+            options,
+            active: activeOption && visible(activeOption) ? activeOption.innerText.trim() : "",
+            expanded: input.getAttribute("aria-expanded") === "true",
+          };
+        })()`);
+        if (!suggestions || typeof suggestions !== "object" || !("options" in suggestions) ||
+            !Array.isArray(suggestions.options)) continue;
+        const optionTexts = suggestions.options.flatMap((option) =>
+          option && typeof option === "object" && "text" in option && typeof option.text === "string" ? [option.text] : []);
+        const exactOption = optionTexts.find((text) => normalizeCategory(text) === expectedCategory);
+        if (process.env.NODE_ENV !== "production") {
+          console.info("[page-create] Category selection attempt", {
+            attempt,
+            query: details.category,
+            options: optionTexts,
+            active: "active" in suggestions ? suggestions.active : "",
+          });
+        }
+        if (!exactOption) continue;
+
+        await command("Input.dispatchKeyEvent", {
+          type: "keyDown", key: "ArrowDown", code: "ArrowDown", windowsVirtualKeyCode: 40,
+        });
+        await command("Input.dispatchKeyEvent", {
+          type: "keyUp", key: "ArrowDown", code: "ArrowDown", windowsVirtualKeyCode: 40,
+        });
+        const active = await evaluatePageScript(command, `(() => {
+          const input = document.querySelector('input[aria-label^="Category"]');
+          const listboxId = input?.getAttribute("aria-controls");
+          const listbox = (listboxId && document.getElementById(listboxId)) || document.querySelector('[role="listbox"]');
+          const activeId = input?.getAttribute("aria-activedescendant");
+          const option = activeId ? document.getElementById(activeId) :
+            listbox?.querySelector('[role="option"][aria-selected="true"]');
+          return option?.innerText.trim() || "";
+        })()`);
+
+        if (typeof active === "string" && normalizeCategory(active) === expectedCategory) {
+          await command("Input.dispatchKeyEvent", {
+            type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13,
+          });
+          await command("Input.dispatchKeyEvent", {
+            type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13,
+          });
+        } else {
+          const exactTarget = await evaluatePageScript(command, `(() => {
+            const normalize = (value) => (value || "").normalize("NFKD").replace(/[\\u0300-\\u036f]/g, "")
+              .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+            const wanted = normalize(${JSON.stringify(details.category)});
+            const input = document.querySelector('input[aria-label^="Category"]');
+            const listboxId = input?.getAttribute("aria-controls");
+            const listbox = (listboxId && document.getElementById(listboxId)) || document.querySelector('[role="listbox"]');
+            const option = [...(listbox?.querySelectorAll('[role="option"]') ?? [])].find((item) => normalize(item.innerText) === wanted);
+            if (!option) return null;
+            option.scrollIntoView({ block: "nearest" });
+            const rect = option.getBoundingClientRect();
+            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+          })()`);
+          if (exactTarget && typeof exactTarget === "object" && "x" in exactTarget && typeof exactTarget.x === "number" &&
+              "y" in exactTarget && typeof exactTarget.y === "number") {
+            await clickWithNativeInput(command, exactTarget.x, exactTarget.y);
+          }
+        }
+
+        const chipDeadline = Date.now() + 1_500;
+        while (Date.now() < chipDeadline) {
+          const chips = await evaluatePageScript(command, `(() => [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
+            .map((element) => element.innerText.trim()).filter(Boolean))()`);
+          if (Array.isArray(chips) && chips.some((chip) => typeof chip === "string" && normalizeCategory(chip) === expectedCategory)) {
+            categorySelected = true;
+            break;
+          }
+          await delay(200);
+        }
+      }
+      if (!categorySelected) return "category-unselected";
+
       const categoryDeadline = Date.now() + 8_000;
-      let categoryClickSent = false;
+      let categoryKeyboardSelectSent = false;
       while (Date.now() < categoryDeadline) {
         let categoryResponse: CdpResponse;
         try {
           categoryResponse = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
             expression: `(async () => {
-              const normalize = (value) => (value || "").normalize("NFKD")
-                .replace(/[\\u0300-\\u036f]/g, "").toLowerCase()
-                .replace(/[^a-z0-9]+/g, " ").trim();
-              const hasCategory = (value, category) =>
-                (" " + normalize(value) + " ").includes(" " + category + " ");
               const input = document.querySelector('input[aria-label="Category (required)"]');
               if (!input) return { state: "missing" };
-              input.focus();
-              const requestedCategory = ${JSON.stringify(details.category.trim())};
-              const requested = normalize(requestedCategory);
               const query = input.value.trim();
               const selectedValues = () => [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
-                .map((element) => element.innerText.trim());
-              const existingSelection = selectedValues();
-              if (existingSelection.some((value) => hasCategory(value, requested))) {
-                return { state: "selected", query, choices: [], target: existingSelection.find((value) => hasCategory(value, requested)), selected: existingSelection };
-              }
-              if (${categoryClickSent}) return { state: "waiting", query, choices: [], selected: existingSelection };
-              await new Promise((resolve) => setTimeout(resolve, 300));
-              const candidates = [...document.querySelectorAll("div, span")]
-                .filter((element) =>
-                  element.children.length === 0 &&
-                  element.innerText?.trim() &&
-                  element.getClientRects().length > 0
-                );
-              const exactMatches = candidates.filter((element) => normalize(element.innerText.trim()) === requested);
-              const matches = exactMatches.length ? exactMatches : candidates.filter((element) =>
-                hasCategory(element.innerText.trim(), requested)
-              );
-              if (!matches.length) {
-                return { state: "waiting", query, choices: [] };
-              }
-              matches.sort((a, b) => {
-                const aRect = a.getBoundingClientRect();
-                const bRect = b.getBoundingClientRect();
-                return aRect.width * aRect.height - bRect.width * bRect.height;
-              });
-              const target = matches[0];
-              const targetText = target.innerText.trim();
-              target.click();
-              await new Promise((resolve) => setTimeout(resolve, 500));
-              const selected = selectedValues();
-              return {
-                state: selected.some((value) => hasCategory(value, requested)) ? "selected" : "clicked",
-                query,
-                choices: matches.map((option) => option.innerText.trim()),
-                target: targetText,
-                selected,
+                .map((element) => element.innerText.trim()).filter(Boolean);
+              const existing = selectedValues();
+              if (existing.length) return { state: "selected", query, choices: [], target: existing[0], selected: existing };
+              const listboxId = input.getAttribute("aria-controls");
+              const getOptions = () => {
+                const listbox = (listboxId && document.getElementById(listboxId)) || document.querySelector('[role="listbox"]');
+                return [...(listbox?.querySelectorAll('[role="option"]') ?? [])].filter((option) => {
+                  const rect = option.getBoundingClientRect();
+                  const style = getComputedStyle(option);
+                  return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" &&
+                    style.display !== "none" && option.getClientRects().length > 0;
+                });
               };
+              let options = getOptions();
+              if (!options.length) {
+                input.focus();
+                await new Promise((resolve) => setTimeout(resolve, 350));
+                options = getOptions();
+              }
+              if (!options.length) {
+                const rect = input.getBoundingClientRect();
+                return { state: "needs-focus", query, choices: [], selected: [], x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+              }
+              if (!${categoryKeyboardSelectSent}) {
+                return { state: "keyboard-select", query, choices: options.map((option) => option.innerText.trim()), expanded: true };
+              }
+              return { state: "waiting", query, choices: options.map((option) => option.innerText.trim()), selected: [], expanded: true, inputValue: input.value };
             })()`,
             awaitPromise: true,
             returnByValue: true,
@@ -975,6 +1135,31 @@ export async function populateFacebookPageForm(
               chips: "selected" in categoryResult ? categoryResult.selected : [],
               state: categoryResult.state,
             });
+          }
+          if (categoryResult.state === "keyboard-select" && !categoryKeyboardSelectSent) {
+            for (const [key, code, virtualKey] of [["ArrowDown", "ArrowDown", 40], ["Enter", "Enter", 13]] as const) {
+              await command("Input.dispatchKeyEvent", {
+                type: "keyDown",
+                key,
+                code,
+                windowsVirtualKeyCode: virtualKey,
+                nativeVirtualKeyCode: virtualKey,
+              });
+              await command("Input.dispatchKeyEvent", {
+                type: "keyUp",
+                key,
+                code,
+                windowsVirtualKeyCode: virtualKey,
+                nativeVirtualKeyCode: virtualKey,
+              });
+            }
+            categoryKeyboardSelectSent = true;
+            await delay(500);
+          }
+          if (categoryResult.state === "needs-focus" && "x" in categoryResult && typeof categoryResult.x === "number" &&
+              "y" in categoryResult && typeof categoryResult.y === "number") {
+            await clickWithNativeInput(command, categoryResult.x, categoryResult.y);
+            await delay(350);
           }
           if (categoryResult.state === "selected") {
             const readyCheck = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
@@ -1009,7 +1194,7 @@ export async function populateFacebookPageForm(
                 const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
                 const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
                 const category = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
-                  .map((element) => element.innerText.trim());
+                  .map((element) => element.innerText.trim()).filter(Boolean);
                 if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio) {
                   return {
                     state: "fields-unverified",
@@ -1019,7 +1204,7 @@ export async function populateFacebookPageForm(
                     bioMatches: Boolean(bio && valueOf(bio) === expected.bio),
                   };
                 }
-                if (!category.some((value) => normalize(value).includes(normalize(expected.category)))) {
+                if (category.length === 0) {
                   return { state: "category-unverified", selectedCategories: category };
                 }
                 return { state: "ready" };
@@ -1050,11 +1235,14 @@ export async function populateFacebookPageForm(
 
             const imagesUploaded = await uploadPageImages(command, images);
             if (!imagesUploaded) return "image-upload-unavailable";
+            for (const step of ["Next", "Skip", "Next", "Done"]) {
+              const clicked = await clickPageSetupButton(command, step);
+              if (!clicked) {
+                console.warn(`[page-create] Waiting for Facebook's post-upload ${step} button timed out.`);
+                return "post-upload-step-unavailable";
+              }
+            }
             return "images-uploaded";
-          }
-          if (categoryResult.state === "clicked") {
-            categoryClickSent = true;
-            await delay(500);
           }
           if (categoryResult.state === "missing") break;
         }
