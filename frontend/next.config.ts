@@ -3,7 +3,8 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   experimental: {
     serverActions: {
-      bodySizeLimit: "25mb",
+      // One group of 20 jobs can carry up to 40 images at 10 MB each.
+      bodySizeLimit: "420mb",
     },
   },
 };

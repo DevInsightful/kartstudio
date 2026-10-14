@@ -670,6 +670,59 @@ async function waitForPageSetupProgress(
   return false;
 }
 
+async function waitForFacebookPageCreationCompletion(
+  command: CdpCommand,
+  pageName: string,
+  timeoutMs = 180_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  const normalize = (value: string) => value.normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const expectedName = normalize(pageName);
+  let confirmedSince = 0;
+  while (Date.now() < deadline) {
+    try {
+      const state = await evaluatePageScript(command, `(() => {
+        const visible = (element) => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" &&
+            style.display !== "none" && element.getClientRects().length > 0;
+        };
+        const body = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
+        const actions = [...document.querySelectorAll('[role="button"], button, a')].filter(visible)
+          .map((element) => (element.getAttribute("aria-label") || element.innerText || "").trim().toLowerCase());
+        const stepMatch = body.match(/\\bstep\\s+(\\d+)\\s+of\\s+\\d+\\b/i);
+        return { path: location.pathname, title: document.title, body: body.slice(0, 5000),
+          step: stepMatch ? Number(stepMatch[1]) : null, actions };
+      })()`);
+      if (state && typeof state === "object" && "path" in state && typeof state.path === "string" &&
+          "title" in state && typeof state.title === "string" && "body" in state && typeof state.body === "string" &&
+          "step" in state && (state.step === null || typeof state.step === "number") &&
+          "actions" in state && Array.isArray(state.actions)) {
+        const text = normalize(`${state.title} ${state.body}`);
+        const hasPageName = expectedName.length > 0 && text.includes(expectedName);
+        const hasSuccessMessage = /\b(page created|your page is ready|successfully created|page was created)\b/i.test(state.body);
+        const setupActions = state.actions.some((action) => typeof action === "string" &&
+          ["next", "skip", "done"].includes(action));
+        const isCreationRoute = /\/pages\/creation(?:\/|$)/i.test(state.path);
+        const confirmed = hasSuccessMessage || (!isCreationRoute && hasPageName && state.step === null && !setupActions);
+        if (confirmed) {
+          if (!confirmedSince) confirmedSince = Date.now();
+          if (Date.now() - confirmedSince >= 3_000) return true;
+        } else {
+          confirmedSince = 0;
+        }
+      }
+    } catch (error) {
+      if (!isTransientExecutionContextError(error)) throw error;
+      confirmedSince = 0;
+    }
+    await delay(500);
+  }
+  return false;
+}
+
 async function hasFacebookPageImageUploadControls(command: CdpCommand) {
   const value = await evaluatePageScript(command, `(() => {
     const kinds = new Set();
@@ -1076,7 +1129,7 @@ export async function populateFacebookPageForm(
   profilePath: string,
   details: PageDetails,
   images: PageImages,
-): Promise<"images-uploaded" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "post-upload-step-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"> {
+): Promise<"images-uploaded" | "completion-unconfirmed" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "post-upload-step-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"> {
   const targetDeadline = Date.now() + TARGET_WAIT_MS;
   let target: DevToolsTarget | null = null;
   let knownTargets: DevToolsTarget[] = [];
@@ -1578,7 +1631,14 @@ export async function populateFacebookPageForm(
                 }
                 return "post-upload-step-unavailable";
               }
-              if (expectedAction === "Done") return "images-uploaded";
+              if (expectedAction === "Done") {
+                const completed = await waitForFacebookPageCreationCompletion(command, details.name);
+                if (completed) return "images-uploaded";
+                if (process.env.NODE_ENV !== "production") {
+                  console.warn("[page-create] Facebook did not confirm the Page after Done; keeping this profile available for review.");
+                }
+                return "completion-unconfirmed";
+              }
               const advanced = await waitForPageSetupProgress(
                 command,
                 action.label,

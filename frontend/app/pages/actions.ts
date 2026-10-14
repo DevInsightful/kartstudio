@@ -1,10 +1,12 @@
 "use server";
 
 import "server-only";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { getLocalWorkspace, prisma } from "@/lib/prisma";
 import { populateFacebookPageForm } from "@/lib/cent-login-automation";
-import { launchLoginBatch } from "@/app/accounts/login-actions";
+import { parsePageDetailsCsv } from "@/lib/page-details-csv";
+import { closeCentProfiles, launchLoginBatch } from "@/app/accounts/login-actions";
 
 const PROFILE_ROOT = path.join(process.cwd(), "data", "browser-profiles");
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
@@ -20,7 +22,125 @@ const ALLOWED_IMAGE_TYPES = new Set([
   "image/avif",
 ]);
 
-type PopulateResult = { state: "images-uploaded" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "post-upload-step-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"; message: string };
+type PopulateResult = { state: "images-uploaded" | "completion-unconfirmed" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "post-upload-step-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"; message: string };
+
+const MAX_PAGE_RUN_ACCOUNTS = 500;
+const MAX_PAGE_IMAGE_SIZE = 10 * 1024 * 1024;
+const PAGE_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp", "image/tiff", "image/heic", "image/heif", "image/avif"]);
+
+function parseIdList(value: FormDataEntryValue | null, label: string) {
+  if (typeof value !== "string") throw new Error(`The ${label} account list is missing.`);
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { throw new Error(`The ${label} account list is invalid.`); }
+  if (!Array.isArray(parsed) || parsed.some((id) => !Number.isSafeInteger(id) || id < 1) || new Set(parsed).size !== parsed.length) {
+    throw new Error(`The ${label} account list is invalid.`);
+  }
+  return parsed as number[];
+}
+
+export async function runPageCreationGroup(formData: FormData): Promise<{ completedIds: number[]; failed: string[]; openForReviewIds: number[] }> {
+  const allIds = parseIdList(formData.get("allAccountIds"), "selected");
+  const groupIds = parseIdList(formData.get("groupAccountIds"), "job group");
+  if (!allIds.length || allIds.length > MAX_PAGE_RUN_ACCOUNTS) throw new Error(`Select between 1 and ${MAX_PAGE_RUN_ACCOUNTS} accounts per run.`);
+  const groupStart = Number(formData.get("groupStart"));
+  if (!Number.isSafeInteger(groupStart) || groupStart < 0 || groupStart + groupIds.length > allIds.length) {
+    throw new Error("The current job group position is invalid.");
+  }
+  if (!groupIds.length || groupIds.length > 20 || groupIds.some((id, index) => allIds[groupStart + index] !== id)) {
+    throw new Error("The current job group does not match the selected account order.");
+  }
+  const categoryValue = formData.get("category");
+  const category = typeof categoryValue === "string" ? categoryValue.trim() : "";
+  if (!category || category.length > 100) throw new Error("Choose a valid Page category.");
+
+  const detailsFile = formData.get("detailsCsv");
+  if (!(detailsFile instanceof File) || detailsFile.size > 2 * 1024 * 1024) throw new Error("Choose a names and bios CSV file under 2 MB.");
+  const details = parsePageDetailsCsv(await detailsFile.text());
+  if (details.length !== allIds.length) throw new Error(`The CSV has ${details.length} name/bio rows, but ${allIds.length} accounts are selected. Make the counts match.`);
+  for (const [index, detail] of details.entries()) {
+    if (!detail.name || detail.name.length > 75) throw new Error(`CSV row ${index + 2} needs a Page name from 1 to 75 characters.`);
+    if (!detail.bio || detail.bio.length > 500) throw new Error(`CSV row ${index + 2} needs a bio from 1 to 500 characters.`);
+  }
+
+  const profileFiles = formData.getAll("profileImages");
+  const coverFiles = formData.getAll("coverImages");
+  if (profileFiles.length !== groupIds.length || coverFiles.length !== groupIds.length ||
+      profileFiles.some((file) => !(file instanceof File)) || coverFiles.some((file) => !(file instanceof File))) {
+    throw new Error(`This group needs exactly ${groupIds.length} profile images and ${groupIds.length} cover images.`);
+  }
+  const imageFiles = [...profileFiles, ...coverFiles] as File[];
+  for (const file of imageFiles) {
+    if (!PAGE_IMAGE_TYPES.has(file.type.toLowerCase())) throw new Error(`${file.name} is not a supported image type.`);
+    if (file.size <= 0 || file.size > MAX_PAGE_IMAGE_SIZE) throw new Error(`${file.name} must be between 1 byte and 10 MB.`);
+  }
+  const imageHashes = new Set<string>();
+  for (const file of imageFiles) {
+    const hash = createHash("sha256").update(Buffer.from(await file.arrayBuffer())).digest("hex");
+    if (imageHashes.has(hash)) throw new Error("These profile and cover folders contain duplicate image content. Remove duplicate files and retry.");
+    imageHashes.add(hash);
+  }
+
+  const workspace = await getLocalWorkspace();
+  const eligible = await prisma.account.findMany({
+    where: { id: { in: allIds }, workspaceId: workspace.id, deletedAt: null, status: "ACTIVE", platform: "FACEBOOK" },
+    select: { id: true },
+  });
+  if (eligible.length !== allIds.length) throw new Error("Every selected account must be active, available, and a Facebook account. Refresh the list and select active accounts.");
+
+  const completedIds: number[] = [];
+  const failed: string[] = [];
+  const openForReviewIds: number[] = [];
+  try {
+    const launch = await launchLoginBatch(groupIds, { reuseOpenProfiles: true });
+    failed.push(...launch.failed);
+    const authenticatedIds = new Set(launch.authenticatedIds);
+    for (const id of groupIds) {
+      if (authenticatedIds.has(id)) continue;
+      if (launch.failed.some((message) => message.includes(`ACC-${String(id).padStart(6, "0")}:`))) continue;
+      const message = launch.populationErrors.find((entry) => entry.startsWith(`ACC-${String(id).padStart(6, "0")}:`));
+      failed.push(message ?? `ACC-${String(id).padStart(6, "0")}: Facebook login could not be verified.`);
+    }
+
+    const readyIds = groupIds.filter((id) => authenticatedIds.has(id));
+    const results = await Promise.all(readyIds.map(async (id) => {
+      const index = allIds.indexOf(id);
+      const localIndex = index - groupStart;
+      try {
+        const profile = await prisma.browserProfile.findUnique({ where: { accountId: id }, select: { profilePath: true } });
+        const result = await populateFacebookPageForm(profile?.profilePath || path.join(PROFILE_ROOT, `account-${id}`), {
+          name: details[index].name,
+          category,
+          bio: details[index].bio,
+        }, {
+          profileImage: new Uint8Array(await (profileFiles[localIndex] as File).arrayBuffer()),
+          profileImageType: (profileFiles[localIndex] as File).type,
+          coverImage: new Uint8Array(await (coverFiles[localIndex] as File).arrayBuffer()),
+          coverImageType: (coverFiles[localIndex] as File).type,
+        });
+        if (result === "images-uploaded") return { id, success: true as const };
+        if (result === "completion-unconfirmed") {
+          return { id, success: false as const, keepOpen: true as const,
+            message: "Facebook did not confirm the final Page save. The Cent profile was left open for review; check it before retrying to avoid creating a duplicate." };
+        }
+        return { id, success: false as const, message: `Facebook automation stopped with status: ${result}.` };
+      } catch (error) {
+        return { id, success: false as const, message: error instanceof Error ? error.message : "Page creation failed." };
+      }
+    }));
+    for (const result of results) {
+      const prefix = `ACC-${String(result.id).padStart(6, "0")}:`;
+      if (result.success) completedIds.push(result.id);
+      else {
+        if ("keepOpen" in result && result.keepOpen) openForReviewIds.push(result.id);
+        failed.push(`${prefix} ${result.message}`);
+      }
+    }
+  } finally {
+    const closed = await closeCentProfiles(groupIds.filter((id) => !openForReviewIds.includes(id)));
+    failed.push(...closed.failed);
+  }
+  return { completedIds, failed, openForReviewIds };
+}
 
 export async function populatePageForm(formData: FormData): Promise<PopulateResult> {
   const accountValue = formData.get("accountId");
@@ -90,7 +210,13 @@ export async function populatePageForm(formData: FormData): Promise<PopulateResu
   if (result === "images-uploaded") {
     return {
       state: result,
-      message: "Facebook's profile and cover images were attached, then the Next → Skip → Next → Done sequence was completed. Check the Cent window for Facebook's final confirmation.",
+      message: "Facebook's profile and cover images were uploaded, and Facebook confirmed the Page after the Next → Skip → Next → Done sequence.",
+    };
+  }
+  if (result === "completion-unconfirmed") {
+    return {
+      state: result,
+      message: "Facebook did not confirm the final Page save. The Cent profile was left open for review; check Facebook before retrying to avoid creating a duplicate.",
     };
   }
   if (result === "next-clicked") {

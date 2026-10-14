@@ -8,18 +8,19 @@ export default async function PagesPage() {
   await connection();
   const workspace = await getLocalWorkspace();
   const accounts = await prisma.account.findMany({
-    where: { workspaceId: workspace.id, deletedAt: null, status: "ACTIVE", platform: "FACEBOOK" },
-    select: { id: true, displayName: true, username: true },
+    where: { workspaceId: workspace.id, deletedAt: null, platform: "FACEBOOK" },
+    select: { id: true, displayName: true, username: true, status: true },
     orderBy: { displayName: "asc" },
   });
   return <div className="section-page">
     <section className="section-intro">
       <p className="eyebrow">PAGES</p>
-      <p>Prepare one Facebook Page at a time using an active account profile. Review the details and submit the Page yourself in Cent.</p>
+      <p>Select active Facebook accounts, import matching Page details, and choose one profile-image folder and one cover-image folder. The helper processes accounts in batches and closes each group of Cent profiles when finished.</p>
     </section>
     <PageForm accounts={accounts.map((account) => ({
       id: account.id,
       label: `${account.displayName}${account.username ? ` · ${account.username}` : ""}`,
+      active: account.status === "ACTIVE",
     }))} />
   </div>;
 }

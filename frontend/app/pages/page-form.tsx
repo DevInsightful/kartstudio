@@ -1,152 +1,225 @@
 "use client";
 
-import { useState, useTransition } from "react";
-import { populatePageForm } from "./actions";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { runPageCreationGroup } from "./actions";
 import { FACEBOOK_PAGE_CATEGORIES } from "@/lib/facebook-page-categories";
+import { parsePageDetailsCsv } from "@/lib/page-details-csv";
 
-type AccountOption = { id: number; label: string };
+type AccountOption = { id: number; label: string; active: boolean };
+type FolderFile = File & { webkitRelativePath?: string };
+const PAGE_SIZES = [10, 25, 50, 100];
+const JOB_OPTIONS = [1, 2, 3, 4, 6, 8, 12, 16, 20];
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+const IMAGE_EXTENSIONS = /\.(jpe?g|png|webp|gif|bmp|tiff?|heic|heif|avif)$/i;
+
+function sortFolderImages(files: FileList | File[]) {
+  return Array.from(files).filter((file) => IMAGE_EXTENSIONS.test(file.name)).sort((a, b) => {
+    const aPath = (a as FolderFile).webkitRelativePath || a.name;
+    const bPath = (b as FolderFile).webkitRelativePath || b.name;
+    return aPath.localeCompare(bPath, undefined, { numeric: true, sensitivity: "base" });
+  });
+}
+
+async function findDuplicateImages(files: File[]) {
+  const seen = new Map<string, string>();
+  const duplicates: string[] = [];
+  for (const file of files) {
+    const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+    const key = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const previous = seen.get(key);
+    if (previous) duplicates.push(`${file.name} duplicates ${previous}`);
+    else seen.set(key, file.name);
+  }
+  return duplicates;
+}
 
 export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
-  const [accountId, setAccountId] = useState("");
-  const [name, setName] = useState("");
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
+  const [jobsAtOnce, setJobsAtOnce] = useState(2);
   const [category, setCategory] = useState("");
-  const [categoryQuery, setCategoryQuery] = useState("");
-  const [categoryOpen, setCategoryOpen] = useState(false);
-  const [activeCategoryIndex, setActiveCategoryIndex] = useState(0);
-  const [bio, setBio] = useState("");
-  const [profileImage, setProfileImage] = useState<File | null>(null);
-  const [coverImage, setCoverImage] = useState<File | null>(null);
+  const [detailsCsv, setDetailsCsv] = useState<File | null>(null);
+  const [profileImages, setProfileImages] = useState<File[]>([]);
+  const [coverImages, setCoverImages] = useState<File[]>([]);
   const [message, setMessage] = useState("");
   const [isError, setIsError] = useState(false);
+  const [progress, setProgress] = useState("");
   const [isPending, startTransition] = useTransition();
-  const filteredCategories = FACEBOOK_PAGE_CATEGORIES.filter((option) =>
-    option.toLowerCase().includes(categoryQuery.trim().toLowerCase()),
-  );
+  const profileFolderRef = useRef<HTMLInputElement>(null);
+  const coverFolderRef = useRef<HTMLInputElement>(null);
 
-  function chooseCategory(value: string) {
-    setCategory(value);
-    setCategoryQuery(value);
-    setCategoryOpen(false);
-    setActiveCategoryIndex(0);
+  useEffect(() => {
+    profileFolderRef.current?.setAttribute("webkitdirectory", "");
+    profileFolderRef.current?.setAttribute("directory", "");
+    coverFolderRef.current?.setAttribute("webkitdirectory", "");
+    coverFolderRef.current?.setAttribute("directory", "");
+  }, []);
+
+  const pageCount = Math.max(1, Math.ceil(accounts.length / pageSize));
+  const visibleAccounts = accounts.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+  const selectedAccounts = accounts.filter((account) => selectedSet.has(account.id));
+  const selectedVisible = visibleAccounts.filter((account) => account.active && selectedSet.has(account.id));
+  const activeVisible = visibleAccounts.filter((account) => account.active);
+
+  function toggleAccount(id: number) {
+    setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
   }
 
-  function populate() {
+  function toggleVisibleAccounts() {
+    const allVisibleSelected = activeVisible.length > 0 && activeVisible.every((account) => selectedSet.has(account.id));
+    setSelectedIds((current) => allVisibleSelected
+      ? current.filter((id) => !activeVisible.some((account) => account.id === id))
+      : [...new Set([...current, ...activeVisible.map((account) => account.id)])]);
+  }
+
+  function startRun() {
     setMessage("");
     setIsError(false);
+    setProgress("");
+    const selected = accounts.filter((account) => selectedSet.has(account.id));
+    if (!selected.length) { setMessage("Select at least one active Facebook account."); setIsError(true); return; }
+    if (selected.length > 500) { setMessage("Select no more than 500 accounts in one run."); setIsError(true); return; }
+    if (!category) { setMessage("Choose a Page category."); setIsError(true); return; }
+    if (!detailsCsv) { setMessage("Choose the CSV with one name and bio for every selected account."); setIsError(true); return; }
+    if (profileImages.length !== selected.length || coverImages.length !== selected.length) {
+      setMessage(`Select folders with exactly ${selected.length} profile images and ${selected.length} cover images.`);
+      setIsError(true);
+      return;
+    }
+    if ([...profileImages, ...coverImages].some((file) => file.size <= 0 || file.size > MAX_IMAGE_SIZE)) {
+      setMessage("Every profile and cover image must be between 1 byte and 10 MB.");
+      setIsError(true);
+      return;
+    }
+
+    const completedIds: number[] = [];
+    const failed: string[] = [];
+    const openForReviewIds: number[] = [];
+    const csvFile = detailsCsv;
     startTransition(async () => {
+      let details: ReturnType<typeof parsePageDetailsCsv>;
       try {
-        const formData = new FormData();
-        formData.set("accountId", accountId);
-        formData.set("name", name);
-        formData.set("category", category);
-        formData.set("bio", bio);
-        if (profileImage) formData.set("profileImage", profileImage);
-        if (coverImage) formData.set("coverImage", coverImage);
-        const result = await populatePageForm(formData);
-        setMessage(result.message);
-        setIsError(!["images-uploaded", "next-clicked", "created-clicked"].includes(result.state));
+        details = parsePageDetailsCsv(await csvFile.text());
       } catch (error) {
-        setMessage(error instanceof Error ? error.message : "Could not populate the Facebook Page form.");
+        setMessage(error instanceof Error ? error.message : "Could not read the names and bios CSV.");
         setIsError(true);
+        return;
       }
+      if (details.length !== selected.length) {
+        setMessage(`The CSV has ${details.length} name/bio rows, but ${selected.length} accounts are selected. Make the counts match.`);
+        setIsError(true);
+        return;
+      }
+      const invalidRow = details.findIndex((detail) => !detail.name || detail.name.length > 75 || !detail.bio || detail.bio.length > 500);
+      if (invalidRow >= 0) {
+        setMessage(`CSV row ${invalidRow + 2} needs a Page name (1–75 characters) and bio (1–500 characters).`);
+        setIsError(true);
+        return;
+      }
+      try {
+        const duplicates = await findDuplicateImages([...profileImages, ...coverImages]);
+        if (duplicates.length) {
+          setMessage(`Remove duplicate image files before starting:\n${duplicates.join("\n")}`);
+          setIsError(true);
+          return;
+        }
+      } catch {
+        setMessage("Could not inspect image files for duplicates. Try selecting the folders again.");
+        setIsError(true);
+        return;
+      }
+      for (let start = 0; start < selected.length; start += jobsAtOnce) {
+        const group = selected.slice(start, start + jobsAtOnce);
+        setProgress(`Working on accounts ${start + 1}–${start + group.length} of ${selected.length}…`);
+        const formData = new FormData();
+        formData.set("allAccountIds", JSON.stringify(selected.map((account) => account.id)));
+        formData.set("groupAccountIds", JSON.stringify(group.map((account) => account.id)));
+        formData.set("groupStart", String(start));
+        formData.set("category", category);
+        formData.set("detailsCsv", csvFile);
+        for (const file of profileImages.slice(start, start + group.length)) formData.append("profileImages", file, file.name);
+        for (const file of coverImages.slice(start, start + group.length)) formData.append("coverImages", file, file.name);
+        try {
+          const result = await runPageCreationGroup(formData);
+          completedIds.push(...result.completedIds);
+          failed.push(...result.failed);
+          openForReviewIds.push(...result.openForReviewIds);
+        } catch (error) {
+          failed.push(...group.map((account) => `ACC-${String(account.id).padStart(6, "0")}: ${error instanceof Error ? error.message : "This job group failed."}`));
+        }
+      }
+      setProgress("");
+      const completedNames = selected.filter((account) => completedIds.includes(account.id)).map((account) => account.label);
+      const openForReviewNames = selected.filter((account) => openForReviewIds.includes(account.id)).map((account) => account.label);
+      const summary = `${completedIds.length} of ${selected.length} Pages completed. ${openForReviewNames.length ? "Unconfirmed Cent profiles remain open for review." : "Cent profiles were closed after each job group."}`;
+      setMessage([summary, ...completedNames.map((label) => `✓ ${label}`), ...failed.map((failure) => `• ${failure}`),
+        ...openForReviewNames.map((label) => `Cent profile kept open for review: ${label}`)].join("\n"));
+      setIsError(failed.length > 0 || completedIds.length !== selected.length);
     });
   }
 
-  return <section className="page-form-panel" aria-labelledby="page-form-title">
+  return <section className="page-form-panel page-batch-panel" aria-labelledby="page-form-title">
     <div className="page-form-heading">
-      <div><p className="eyebrow">SINGLE PAGE · TEST</p><h3 id="page-form-title">Create one Facebook Page</h3>
-    <p>Select one active account, enter the Page details, and choose both images. The helper creates the Page, advances with Next, and attaches the profile picture and cover photo.</p></div>
+      <div><p className="eyebrow">PAGES · BATCH</p><h3 id="page-form-title">Create Pages for selected accounts</h3>
+        <p>Select active accounts across the paginated list. Jobs run in groups of the selected size; each group opens, completes, and closes its Cent profiles before the next group.</p>
+      </div>
     </div>
-    {accounts.length === 0 ? <p className="account-alert error-alert" role="status">No active accounts are available. Sign in to an account and verify its status in Accounts first.</p> : <>
-      <label className="modal-field">Active Facebook account
-        <select value={accountId} onChange={(event) => setAccountId(event.target.value)} disabled={isPending}>
-          <option value="">Select an account</option>
-          {accounts.map((account) => <option value={account.id} key={account.id}>{account.label}</option>)}
+
+    {accounts.length === 0 ? <p className="account-alert error-alert" role="status">No Facebook accounts are listed yet. Import accounts first, then verify the accounts you want to use are active.</p> : <>
+      <div className="page-account-toolbar">
+        <strong>{selectedIds.length} selected</strong>
+        <label>Rows per page
+          <select value={pageSize} onChange={(event) => { setPageSize(Number(event.target.value)); setCurrentPage(1); }} disabled={isPending}>
+            {PAGE_SIZES.map((size) => <option key={size} value={size}>{size}</option>)}
+          </select>
+        </label>
+      </div>
+      <div className="page-account-list" role="region" aria-label="Facebook accounts">
+        <table>
+          <thead><tr><th><input type="checkbox" aria-label="Select active accounts on this page" checked={activeVisible.length > 0 && selectedVisible.length === activeVisible.length} onChange={toggleVisibleAccounts} disabled={isPending || !activeVisible.length} /></th><th>Account</th><th>Status</th></tr></thead>
+          <tbody>{visibleAccounts.map((account) => <tr key={account.id}>
+            <td><input type="checkbox" aria-label={`Select ${account.label}`} checked={selectedSet.has(account.id)} onChange={() => toggleAccount(account.id)} disabled={isPending || !account.active} /></td>
+            <td>{account.label}</td><td><span className={account.active ? "page-account-active" : "page-account-inactive"}>{account.active ? "Active" : "Sign-in needed"}</span></td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+      <div className="page-pagination">
+        <span>Page {currentPage} of {pageCount} · {accounts.length} accounts</span>
+        <div><button type="button" onClick={() => setCurrentPage((page) => Math.max(1, page - 1))} disabled={isPending || currentPage <= 1}>Previous</button><button type="button" onClick={() => setCurrentPage((page) => Math.min(pageCount, page + 1))} disabled={isPending || currentPage >= pageCount}>Next</button></div>
+      </div>
+
+      <label className="modal-field">Jobs at once
+        <select value={jobsAtOnce} onChange={(event) => setJobsAtOnce(Number(event.target.value))} disabled={isPending}>
+          {JOB_OPTIONS.map((count) => <option key={count} value={count}>{count} at a time</option>)}
+        </select>
+        <small>Each group runs together, then its Cent profiles close before the next group starts.</small>
+      </label>
+      <label className="modal-field">Page category
+        <select value={category} onChange={(event) => setCategory(event.target.value)} disabled={isPending}>
+          <option value="">Choose a category</option>
+          {FACEBOOK_PAGE_CATEGORIES.map((value) => <option key={value} value={value}>{value}</option>)}
         </select>
       </label>
-      <label className="modal-field">Page name
-        <input value={name} onChange={(event) => setName(event.target.value)} maxLength={75} required disabled={isPending} />
+      <label className="modal-field">Names and bios CSV
+        <input type="file" accept=".csv,text/csv" onChange={(event) => setDetailsCsv(event.target.files?.[0] ?? null)} disabled={isPending} />
+        <small>{detailsCsv ? detailsCsv.name : "One data row for each selected account, in account-list order."} <a href="/pages/import-template" download>Download example CSV</a></small>
       </label>
-      <div className="modal-field page-category-field" onBlur={(event) => {
-        if (!(event.relatedTarget instanceof Node) || !event.currentTarget.contains(event.relatedTarget)) setCategoryOpen(false);
-      }}>
-        <label htmlFor="page-category-search">Category</label>
-        <div className="page-category-control">
-          <input
-            id="page-category-search"
-            role="combobox"
-            aria-autocomplete="list"
-            aria-expanded={categoryOpen}
-            aria-controls="page-category-options"
-            aria-activedescendant={categoryOpen && filteredCategories.length ? `page-category-option-${activeCategoryIndex}` : undefined}
-            autoComplete="off"
-            value={categoryQuery}
-            onFocus={() => { setCategoryOpen(true); setActiveCategoryIndex(0); }}
-            onChange={(event) => {
-              setCategoryQuery(event.target.value);
-              setCategory("");
-              setCategoryOpen(true);
-              setActiveCategoryIndex(0);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "ArrowDown" && filteredCategories.length) {
-                event.preventDefault();
-                setCategoryOpen(true);
-                setActiveCategoryIndex((index) => (index + 1) % filteredCategories.length);
-              } else if (event.key === "ArrowUp" && filteredCategories.length) {
-                event.preventDefault();
-                setCategoryOpen(true);
-                setActiveCategoryIndex((index) => (index - 1 + filteredCategories.length) % filteredCategories.length);
-              } else if (event.key === "Enter" && categoryOpen && filteredCategories.length) {
-                event.preventDefault();
-                chooseCategory(filteredCategories[activeCategoryIndex] ?? filteredCategories[0]);
-              } else if (event.key === "Escape") {
-                setCategoryOpen(false);
-              }
-            }}
-            placeholder="Search categories…"
-            disabled={isPending}
-          />
-          {categoryOpen && !isPending && <ul className="page-category-options" id="page-category-options" role="listbox" aria-label="Page categories">
-            {filteredCategories.length ? filteredCategories.map((option, index) => <li
-              id={`page-category-option-${index}`}
-              role="option"
-              aria-selected={category === option}
-              className={index === activeCategoryIndex ? "active" : ""}
-              key={option}
-              onMouseEnter={() => setActiveCategoryIndex(index)}
-            ><button type="button" tabIndex={-1} onMouseDown={(event) => event.preventDefault()} onClick={() => chooseCategory(option)}>{option}</button></li>) :
-              <li className="page-category-empty" role="presentation">No matching categories</li>}
-          </ul>}
-        </div>
-        <small>{category ? `Selected: ${category}` : `${FACEBOOK_PAGE_CATEGORIES.length} categories · choose a suggestion to select it`}</small>
-      </div>
-      <label className="modal-field">Bio
-        <textarea value={bio} onChange={(event) => setBio(event.target.value)} maxLength={500} rows={4} required disabled={isPending} />
+      <div className="page-import-example"><strong>CSV format · header is not counted</strong><pre>{`name,bio\nLuxe Living,Premium furniture for your home.\nHome Style,Modern interiors and decor.`}</pre><small>Every row needs a name and bio. Row 1 maps to selected account 1, row 2 to selected account 2, and so on.</small></div>
+      <label className="modal-field">Profile images folder
+        <input ref={profileFolderRef} type="file" multiple accept="image/*,.heic,.heif,.avif" onChange={(event) => setProfileImages(sortFolderImages(event.target.files ?? []))} disabled={isPending} />
+        <small>{profileImages.length} image files · ordered by filename to match the selected accounts.</small>
       </label>
-      <label className="modal-field">Profile picture
-        <input
-          type="file"
-          accept="image/*,image/heif,image/heic"
-          required
-          disabled={isPending}
-          onChange={(event) => setProfileImage(event.target.files?.[0] ?? null)}
-        />
-        <small>{profileImage ? profileImage.name : "Required · image up to 10 MB"}</small>
+      <label className="modal-field">Cover images folder
+        <input ref={coverFolderRef} type="file" multiple accept="image/*,.heic,.heif,.avif" onChange={(event) => setCoverImages(sortFolderImages(event.target.files ?? []))} disabled={isPending} />
+        <small>{coverImages.length} image files · ordered by filename to match the selected accounts.</small>
       </label>
-      <label className="modal-field">Cover photo
-        <input
-          type="file"
-          accept="image/*,image/heif,image/heic"
-          required
-          disabled={isPending}
-          onChange={(event) => setCoverImage(event.target.files?.[0] ?? null)}
-        />
-        <small>{coverImage ? coverImage.name : "Required · image up to 10 MB"}</small>
-      </label>
-      <p className="page-form-note">Choose a category from the searchable list. Facebook may require additional information or confirmation. The helper never retries an uncertain click; check the Cent window before running it again.</p>
-      <div className="page-form-actions"><button className="primary-button" type="button" onClick={populate} disabled={isPending || !accountId || !name.trim() || !category || !bio.trim() || !profileImage || !coverImage}>{isPending ? "Creating Page and uploading images…" : "Create Page and upload images"}</button></div>
+      {selectedAccounts.length > 0 && <div className="page-selection-order"><strong>Account and image order</strong><ol>{selectedAccounts.slice(0, 8).map((account, index) => <li key={account.id}>{index + 1}. {account.label} <span>← CSV row {index + 1} · profile image {index + 1} · cover image {index + 1}</span></li>)}</ol>{selectedAccounts.length > 8 && <small>…and {selectedAccounts.length - 8} more selected accounts.</small>}</div>}
+      <p className="page-form-note">Each image must be 10 MB or smaller. The selected account count, CSV row count, and image count in each folder must match. Facebook may ask for extra verification; the affected job will be reported and the profile will close after the group finishes.</p>
+      <div className="page-form-actions"><button className="primary-button" type="button" onClick={startRun} disabled={isPending || !selectedIds.length || !category || !detailsCsv || !profileImages.length || !coverImages.length}>{isPending ? "Creating Pages…" : `Create ${selectedIds.length || "selected"} Pages`}</button></div>
     </>}
-    {message && <p className={`account-alert ${isError ? "error-alert" : "success-alert"}`} role={isError ? "alert" : "status"}>{message}</p>}
+    {progress && <p className="account-alert" role="status">{progress}</p>}
+    {message && <pre className={`account-alert page-batch-result ${isError ? "error-alert" : "success-alert"}`} role={isError ? "alert" : "status"}>{message}</pre>}
   </section>;
 }

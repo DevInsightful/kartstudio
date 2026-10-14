@@ -27,6 +27,7 @@ type LoginState = "authenticated" | "session-reused" | "login-required" | "unver
 type LaunchOutcome = { error?: string };
 type WindowBounds = { x: number; y: number; width: number; height: number };
 type WorkArea = WindowBounds;
+type LaunchOptions = { reuseOpenProfiles?: boolean };
 
 async function getPrimaryWorkArea(): Promise<WorkArea> {
   const script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; [PSCustomObject]@{x=$b.X;y=$b.Y;width=$b.Width;height=$b.Height} | ConvertTo-Json -Compress";
@@ -81,10 +82,12 @@ async function launchOne(
   accountId: number,
   workspaceId: string,
   bounds: WindowBounds,
+  reuseOpenProfile = false,
 ): Promise<LaunchOutcome> {
   const profilePath = profileDirectory(accountId);
   mkdirSync(profilePath, { recursive: true });
   const prior = await prisma.browserProfile.findUnique({ where: { accountId }, select: { status: true } });
+  if (prior?.status === "OPEN" && reuseOpenProfile) return {};
   if (prior?.status === "OPEN" || prior?.status === "STARTING") {
     return { error: "This account profile is already marked open. Close its Cent window before launching it again." };
   }
@@ -168,7 +171,7 @@ async function persistLoginState(workspaceId: string, accountId: number, loginSt
   });
 }
 
-export async function launchLoginBatch(ids: number[]): Promise<LaunchResult> {
+export async function launchLoginBatch(ids: number[], options: LaunchOptions = {}): Promise<LaunchResult> {
   if (process.platform !== "win32") throw new Error("Cent profile launching is currently supported on Windows only.");
   if (!Array.isArray(ids) || ids.length < 1 || ids.length > MAX_BATCH_SIZE || ids.some((id) => !Number.isSafeInteger(id) || id < 1) || new Set(ids).size !== ids.length) {
     throw new Error(`Choose between 1 and ${MAX_BATCH_SIZE} accounts for this batch.`);
@@ -202,6 +205,7 @@ export async function launchLoginBatch(ids: number[]): Promise<LaunchResult> {
         account.id,
         workspace.id,
         tileBounds(workArea, index, orderedAccounts.length),
+        options.reuseOpenProfiles === true,
       );
       if (outcome.error) failed.push(`ACC-${String(account.id).padStart(6, "0")}: ${outcome.error}`);
       else openedIds.push(account.id);
@@ -244,4 +248,55 @@ export async function launchLoginBatch(ids: number[]): Promise<LaunchResult> {
 
   revalidatePath("/accounts");
   return { openedIds, failed, manualLoginIds, sessionReusedIds, authenticatedIds, loginRequiredIds, unverifiedIds, populationErrors };
+}
+
+export async function closeCentProfiles(ids: number[]): Promise<{ closedIds: number[]; failed: string[] }> {
+  if (!Array.isArray(ids) || ids.length > MAX_BATCH_SIZE || ids.some((id) => !Number.isSafeInteger(id) || id < 1) || new Set(ids).size !== ids.length) {
+    throw new Error(`Choose no more than ${MAX_BATCH_SIZE} valid accounts to close.`);
+  }
+  if (process.platform !== "win32") throw new Error("Cent profile closing is currently supported on Windows only.");
+
+  const workspace = await getLocalWorkspace();
+  const accounts = await prisma.account.findMany({
+    where: { id: { in: ids }, workspaceId: workspace.id, deletedAt: null },
+    select: { id: true },
+  });
+  if (accounts.length !== ids.length) throw new Error("One or more selected accounts are unavailable.");
+
+  const closedIds: number[] = [];
+  const failed: string[] = [];
+  for (const accountId of ids) {
+    const profilePath = profileDirectory(accountId);
+    const script = `
+$ErrorActionPreference = 'Stop'
+$profile = [IO.Path]::GetFullPath([Environment]::GetEnvironmentVariable('KARTSTUDIO_PROFILE_PATH'))
+$roots = @(Get-CimInstance Win32_Process | Where-Object {
+  $_.CommandLine -and $_.CommandLine.IndexOf($profile, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+  $_.CommandLine -notmatch '(?:^|\\s)--type='
+})
+foreach ($root in $roots) {
+  $result = Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', [string]$root.ProcessId, '/T', '/F') -Wait -PassThru -NoNewWindow
+  if ($result.ExitCode -ne 0 -and (Get-Process -Id $root.ProcessId -ErrorAction SilentlyContinue)) {
+    throw "Could not close the Cent profile process."
+  }
+}
+`;
+    try {
+      await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+        windowsHide: true,
+        timeout: 20_000,
+        encoding: "utf8",
+        env: { ...process.env, KARTSTUDIO_PROFILE_PATH: profilePath },
+      });
+      closedIds.push(accountId);
+      await prisma.browserProfile.updateMany({
+        where: { accountId },
+        data: { status: "CLOSED", lastClosedAt: new Date() },
+      });
+    } catch (error) {
+      failed.push(`ACC-${String(accountId).padStart(6, "0")}: ${error instanceof Error ? error.message : "Could not close the Cent profile."}`);
+    }
+  }
+  revalidatePath("/accounts");
+  return { closedIds, failed };
 }
