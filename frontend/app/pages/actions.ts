@@ -144,7 +144,7 @@ export async function populatePageForm(formData: FormData): Promise<PopulateResu
   if (result === "image-upload-unavailable") {
     return {
       state: result,
-      message: "Facebook's profile picture and cover upload controls did not appear after Next. The browser is open; add both images manually in Cent.",
+      message: "Facebook did not confirm that both profile and cover image uploads completed successfully. The helper left Cent on the current setup step; check the upload status before continuing.",
     };
   }
   if (result === "post-upload-step-unavailable") {

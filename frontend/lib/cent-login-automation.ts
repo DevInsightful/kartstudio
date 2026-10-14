@@ -11,6 +11,8 @@ type WindowBounds = { x: number; y: number; width: number; height: number };
 type DevToolsTarget = { id?: string; type?: string; url?: string; webSocketDebuggerUrl?: string };
 type CdpResponse = {
   id?: number;
+  method?: string;
+  params?: Record<string, unknown>;
   result?: {
     result?: { value?: unknown };
     windowId?: number;
@@ -34,11 +36,27 @@ const DEBUG_PORT_FILE = "DevToolsActivePort";
 const TARGET_WAIT_MS = 30_000;
 const FORM_WAIT_MS = 30_000;
 const LOGIN_RESULT_WAIT_MS = 30_000;
+const PAGE_CREATE_RESPONSE_WAIT_MS = 5 * 60_000;
+const PAGE_IMAGE_UPLOAD_WAIT_MS = 120_000;
+const PAGE_ACTION_STABLE_MS = 1_500;
 const COMMAND_WAIT_MS = 10_000;
 const execFileAsync = promisify(execFile);
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function removeTemporaryPageImages(directory: string) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      await rm(directory, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+      if (!(["EBUSY", "EPERM", "ENOTEMPTY"] as unknown[]).includes(code) || attempt === 19) throw error;
+      await delay(250);
+    }
+  }
 }
 
 function isTransientExecutionContextError(error: unknown) {
@@ -114,28 +132,28 @@ if (-not $restored) { throw 'Cent did not expose a restorable window for this ac
   });
 }
 
-async function getFacebookTarget(profilePath: string): Promise<DevToolsTarget | null> {
+async function getFacebookTargets(profilePath: string): Promise<DevToolsTarget[]> {
   let portFile: string;
   try {
     portFile = await readFile(path.join(profilePath, DEBUG_PORT_FILE), "utf8");
   } catch (error) {
-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return [];
     throw error;
   }
 
   const port = Number(portFile.split(/\r?\n/)[0]);
-  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return null;
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return [];
   let response: Response;
   try {
     response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2_000) });
   } catch (error) {
-    if (error instanceof TypeError || error instanceof DOMException) return null;
+    if (error instanceof TypeError || error instanceof DOMException) return [];
     throw error;
   }
-  if (!response.ok) return null;
+  if (!response.ok) return [];
 
   const targets = await response.json() as DevToolsTarget[];
-  return targets.find((target) => {
+  return targets.filter((target) => {
     if (target.type !== "page" || !target.url || !target.webSocketDebuggerUrl) return false;
     try {
       const pageHost = new URL(target.url).hostname.toLowerCase();
@@ -146,7 +164,39 @@ async function getFacebookTarget(profilePath: string): Promise<DevToolsTarget | 
     } catch {
       return false;
     }
-  }) ?? null;
+  });
+}
+
+async function getFacebookTarget(profilePath: string): Promise<DevToolsTarget | null> {
+  return (await getFacebookTargets(profilePath))[0] ?? null;
+}
+
+async function waitForNewFacebookTarget(
+  profilePath: string,
+  knownTargetIds: Set<string>,
+  command: CdpCommand,
+  timeoutMs: number,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const hasSetupAction = await evaluatePageScript(command, `(() => [...document.querySelectorAll('[role="button"], button, a')].some((element) => {
+        const label = (element.getAttribute('aria-label') || element.innerText || '').trim().toLowerCase();
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return ['next', 'skip', 'done'].includes(label) && rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' &&
+          style.display !== 'none' && element.getClientRects().length > 0;
+      }))()`);
+      if (hasSetupAction === true) return null;
+    } catch (error) {
+      if (!isTransientExecutionContextError(error)) throw error;
+    }
+    const targets = await getFacebookTargets(profilePath);
+    const createdTarget = targets.find((candidate) => candidate.id && !knownTargetIds.has(candidate.id));
+    if (createdTarget) return createdTarget;
+    await delay(400);
+  }
+  return null;
 }
 
 function connect(url: string): Promise<WebSocket> {
@@ -208,9 +258,55 @@ function sendCommand(socket: WebSocket, id: number, method: string, params: Reco
   });
 }
 
+type PageNetworkRecord = { requestId: string; resourceType: string; method: string; status?: number; failure?: string };
+
+function observePageNetwork(socket: WebSocket) {
+  const records = new Map<string, PageNetworkRecord>();
+  const listener = (data: WebSocket.RawData) => {
+    let message: CdpResponse;
+    try {
+      message = JSON.parse(data.toString()) as CdpResponse;
+    } catch {
+      return;
+    }
+    const params = message.params;
+    if (!params || typeof params.requestId !== "string") return;
+    const requestId = params.requestId;
+    if (message.method === "Network.requestWillBeSent") {
+      const request = params.request;
+      if (!request || typeof request !== "object") return;
+      const requestData = request as Record<string, unknown>;
+      const method = typeof requestData.method === "string" ? requestData.method : "";
+      const resourceType = typeof params.type === "string" ? params.type : "";
+      if (method.toUpperCase() === "POST" || resourceType === "XHR" || resourceType === "Fetch") {
+        records.set(requestId, { requestId, method, resourceType });
+      }
+    } else if (message.method === "Network.responseReceived") {
+      const record = records.get(requestId);
+      const response = params.response;
+      if (record && response && typeof response === "object" && "status" in response &&
+          typeof response.status === "number") record.status = response.status;
+    } else if (message.method === "Network.loadingFailed") {
+      const record = records.get(requestId);
+      if (record) record.failure = typeof params.errorText === "string" ? params.errorText : "request failed";
+    }
+  };
+  socket.on("message", listener);
+  return {
+    snapshot: () => [...records.values()].map(({ requestId: _requestId, ...record }) => ({ ...record })),
+    dispose: () => socket.off("message", listener),
+  };
+}
+
 async function evaluatePageScript(command: CdpCommand, expression: string) {
   const response = await command("Runtime.evaluate", { expression, returnByValue: true });
-  if (response.result?.exceptionDetails) throw new Error("Facebook Page browser script failed.");
+  if (response.result?.exceptionDetails) {
+    const details = response.result.exceptionDetails;
+    const detailText = typeof details === "string" ? details : JSON.stringify(details);
+    const transientMessage = detailText.match(/cannot find default execution context|execution context was destroyed|context with specified id not found|inspected target navigated or closed/i)?.[0];
+    if (transientMessage) throw new Error(transientMessage);
+    throw new Error("Facebook Page browser script failed.");
+  }
   return response.result?.result?.value;
 }
 
@@ -244,32 +340,46 @@ async function clickCreatePageButton(command: CdpCommand, details: PageDetails) 
     };
     const controls = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')]
       .filter(visible);
-    const fieldText = (element) => [
-      element.getAttribute("aria-label"),
-      element.getAttribute("placeholder"),
-      element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
-      element.closest("label")?.innerText,
-    ].filter(Boolean).join(" ").trim().toLowerCase();
-    const findField = (pattern) => {
+    const fieldText = (element) => {
+      const labelText = element.labels ? [...element.labels]
+        .flatMap((label) => [...label.querySelectorAll("span")].map((span) => span.innerText.trim()))
+        .find(Boolean) : "";
+      return (element.getAttribute("aria-label") || element.getAttribute("placeholder") ||
+        labelText || element.closest("label")?.innerText || "").trim().toLowerCase();
+    };
+    const findField = (pattern, expectedValue) => {
       const direct = controls.find((field) => pattern.test(fieldText(field)));
       if (direct) return direct;
       const label = [...document.querySelectorAll("label")].find((candidate) => visible(candidate) &&
         [...candidate.querySelectorAll("span")].some((span) =>
           pattern.test(span.innerText.trim().toLowerCase())));
-      return label?.control ??
+      const labelled = label?.control ??
         label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
+      if (labelled) return labelled;
+      // Facebook sometimes renders the visible field label outside the input's
+      // associated <label>; use the exact populated value as a safe fallback.
+      const wanted = normalizeValue(expectedValue);
+      return controls.find((field) => valueOf(field) === wanted) ?? null;
     };
-    const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
-      ? field.value.trim()
-      : field.textContent?.trim() || "";
-    const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
-    const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
+    const normalizeValue = (value) => (value || "").replace(/\\u00a0/g, " ")
+      .replace(/\\r\\n?/g, "\\n").replace(/[ \\t]+/g, " ").trim();
+    const valueOf = (field) => normalizeValue(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+      ? field.value
+      : field instanceof HTMLElement && field.isContentEditable ? field.innerText : field.innerText || field.textContent || "");
+    const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/, expected.name);
+    const bio = findField(/^bio(?:\\s*\\(optional\\))?$/, expected.bio);
     const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
       .map((element) => element.innerText.trim()).filter(Boolean);
-    if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
-        selected.length === 0) {
-      return { state: "fields-unverified" };
+    if (!name || valueOf(name) !== normalizeValue(expected.name) || !bio || valueOf(bio) !== normalizeValue(expected.bio)) {
+      return {
+        state: "fields-unverified",
+        nameFound: Boolean(name),
+        nameMatches: Boolean(name && valueOf(name) === normalizeValue(expected.name)),
+        bioFound: Boolean(bio),
+        bioMatches: Boolean(bio && valueOf(bio) === normalizeValue(expected.bio)),
+      };
     }
+    if (selected.length === 0) return { state: "category-unverified", selectedCategoryCount: 0 };
     const target = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
       .find(visible) ?? [...document.querySelectorAll("span")]
         .find((element) => element.innerText.trim() === "Create Page" && visible(element))
@@ -282,11 +392,27 @@ async function clickCreatePageButton(command: CdpCommand, details: PageDetails) 
     const rect = target.getBoundingClientRect();
     return { state: "ready", x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
   })()`;
-  const first = await evaluatePageScript(command, clickExpression);
+  let first: unknown;
+  const readyDeadline = Date.now() + 30_000;
+  while (Date.now() < readyDeadline) {
+    try {
+      first = await evaluatePageScript(command, clickExpression);
+    } catch (error) {
+      if (!isTransientExecutionContextError(error)) throw error;
+      await delay(400);
+      continue;
+    }
+    if (first && typeof first === "object" && "state" in first && first.state === "ready") break;
+    await delay(400);
+  }
   if (!first || typeof first !== "object" || !("state" in first)) {
     throw new Error("Facebook Create Page click script returned an unexpected result.");
   }
-  if (first.state === "fields-unverified") return "fields-unverified" as const;
+  if (first.state === "fields-unverified") {
+    console.warn("[page-create] Create Page pre-click field verification failed.", first);
+    return "fields-unverified" as const;
+  }
+  if (first.state === "category-unverified") return "category-unverified" as const;
   if (first.state === "button-unavailable" || first.state === "button-disabled") {
     return "button-unavailable" as const;
   }
@@ -314,12 +440,13 @@ async function clickCreatePageButton(command: CdpCommand, details: PageDetails) 
       };
       const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')]
         .filter(visible);
-      const fieldText = (element) => [
-        element.getAttribute("aria-label"),
-        element.getAttribute("placeholder"),
-        element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
-        element.closest("label")?.innerText,
-      ].filter(Boolean).join(" ").trim().toLowerCase();
+      const fieldText = (element) => {
+        const labelText = element.labels ? [...element.labels]
+          .flatMap((label) => [...label.querySelectorAll("span")].map((span) => span.innerText.trim()))
+          .find(Boolean) : "";
+        return (element.getAttribute("aria-label") || element.getAttribute("placeholder") ||
+          labelText || element.closest("label")?.innerText || "").trim().toLowerCase();
+      };
       const findField = (pattern) => {
         const direct = fields.find((field) => pattern.test(fieldText(field)));
         if (direct) return direct;
@@ -329,16 +456,18 @@ async function clickCreatePageButton(command: CdpCommand, details: PageDetails) 
         return label?.control ??
           label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
       };
-      const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
-        ? field.value.trim()
-        : field.textContent?.trim() || "";
+      const normalizeValue = (value) => (value || "").replace(/\\u00a0/g, " ")
+        .replace(/\\r\\n?/g, "\\n").replace(/[ \\t]+/g, " ").trim();
+      const valueOf = (field) => normalizeValue(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+        ? field.value
+        : field instanceof HTMLElement && field.isContentEditable ? field.innerText : field.innerText || field.textContent || "");
       const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
       const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
       const selected = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
         .map((element) => element.innerText.trim()).filter(Boolean);
-      if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio ||
+      if (!name || valueOf(name) !== normalizeValue(expected.name) || !bio || valueOf(bio) !== normalizeValue(expected.bio) ||
           selected.length === 0) {
-        return { state: "fields-changed" };
+        return { state: "fields-changed", nameFound: Boolean(name), bioFound: Boolean(bio), selectedCategoryCount: selected.length };
       }
       const button = [...document.querySelectorAll('[role="button"][aria-label="Create Page"]')]
         .find(visible);
@@ -354,101 +483,272 @@ async function clickCreatePageButton(command: CdpCommand, details: PageDetails) 
   if (retryState && typeof retryState === "object" && "state" in retryState &&
       retryState.state === "visible" && "x" in retryState && typeof retryState.x === "number" &&
       "y" in retryState && typeof retryState.y === "number") {
-    await clickWithNativeInput(command, retryState.x, retryState.y);
     if (process.env.NODE_ENV !== "production") {
-      console.info("[page-create] Retried Create Page once because the button remained visible and enabled.");
+      console.info("[page-create] Facebook is still processing Create Page; waiting for the next setup step instead of submitting again.");
     }
   }
   return "clicked" as const;
 }
 
-async function clickNextButton(command: CdpCommand) {
-  await delay(2_500);
-  const deadline = Date.now() + 7_000;
-  while (Date.now() < deadline) {
-    let state: unknown;
-    try {
-      state = await evaluatePageScript(command, `(() => {
-        const button = [...document.querySelectorAll('[role="button"][aria-label="Next"]')]
-          .find((element) => {
-            const rect = element.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0 &&
-              getComputedStyle(element).visibility !== "hidden" &&
-              getComputedStyle(element).display !== "none" && element.offsetParent !== null;
-          });
-        if (!button || button.getAttribute("aria-disabled") === "true" ||
-            (button instanceof HTMLButtonElement && button.disabled)) return null;
-        button.scrollIntoView({ block: "center" });
-        const rect = button.getBoundingClientRect();
-        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-      })()`);
-    } catch (error) {
-      if (!isTransientExecutionContextError(error)) throw error;
-      await delay(400);
-      continue;
-    }
-    if (state && typeof state === "object" && "x" in state && typeof state.x === "number" &&
-        "y" in state && typeof state.y === "number") {
-      await clickWithNativeInput(command, state.x, state.y);
-      if (process.env.NODE_ENV !== "production") {
-        console.info("[page-create] Clicked Facebook's Next button with native browser input.");
-      }
-      return true;
-    }
-    await delay(400);
-  }
-  return false;
+const PAGE_SETUP_ACTIONS = ["Next", "Skip", "Done"] as const;
+type PageSetupAction = typeof PAGE_SETUP_ACTIONS[number];
+
+type PageSetupSnapshot = { body: string; actions: string[]; heading: string; step: number | null };
+
+async function readPageSetupSnapshot(command: CdpCommand): Promise<PageSetupSnapshot | null> {
+  const value = await evaluatePageScript(command, `(() => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" &&
+        style.display !== "none" && element.getClientRects().length > 0;
+    };
+    const allowed = ${JSON.stringify(PAGE_SETUP_ACTIONS.map((label) => label.toLowerCase()))};
+    const actions = [...document.querySelectorAll('[role="button"], button, a')].filter(visible)
+      .map((element) => (element.getAttribute("aria-label") || element.innerText || "").trim())
+      .filter((label) => allowed.includes(label.toLowerCase()));
+    const body = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
+    const headings = [...document.querySelectorAll('h1, h2, [role="heading"]')]
+      .filter(visible).map((element) => (element.innerText || "").trim()).filter(Boolean);
+    const stepMatch = body.match(/\\bstep\\s+(\\d+)\\s+of\\s+\\d+\\b/i);
+    return {
+      body: body.slice(0, 1600),
+      actions: [...new Set(actions)],
+      heading: headings.join(" | "),
+      step: stepMatch ? Number(stepMatch[1]) : null,
+    };
+  })()`);
+  if (!value || typeof value !== "object" || !("body" in value) || typeof value.body !== "string" ||
+      !("actions" in value) || !Array.isArray(value.actions) || !("heading" in value) || typeof value.heading !== "string") return null;
+  return {
+    body: value.body,
+    actions: value.actions.filter((label): label is string => typeof label === "string"),
+    heading: value.heading,
+    step: "step" in value && typeof value.step === "number" ? value.step : null,
+  };
 }
 
-async function clickPageSetupButton(command: CdpCommand, label: string) {
-  const deadline = Date.now() + 10_000;
+async function clickAvailablePageSetupAction(
+  command: CdpCommand,
+  requiredAction?: PageSetupAction,
+  timeoutMs = 180_000,
+  stableReadyMs = 0,
+) {
+  // Facebook can keep Next disabled while it processes the uploaded images.
+  // Inspect all currently visible actions and wait for an enabled one.
+  const deadline = Date.now() + timeoutMs;
+  const priority: PageSetupAction[] = requiredAction
+    ? [requiredAction]
+    : ["Next", "Skip", "Done"];
+  let readySignature = "";
+  let readySince = 0;
   while (Date.now() < deadline) {
     let state: unknown;
     try {
       state = await evaluatePageScript(command, `(() => {
-        const expected = ${JSON.stringify(label)}.trim().toLowerCase();
         const visible = (element) => {
           const rect = element.getBoundingClientRect();
           const style = getComputedStyle(element);
           return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" &&
             style.display !== "none" && element.getClientRects().length > 0;
         };
-        const target = [...document.querySelectorAll('[role="button"], button, a')].find((element) => {
-          if (!visible(element)) return false;
-          const accessibleName = (element.getAttribute("aria-label") || element.innerText || "").trim().toLowerCase();
-          return accessibleName === expected;
-        }) ?? [...document.querySelectorAll("span, div")].find((element) =>
-          visible(element) && element.children.length === 0 &&
-          (element.innerText || "").trim().toLowerCase() === expected);
-        if (!target) return { state: "waiting" };
-        if (target.getAttribute("aria-disabled") === "true" ||
-            (target instanceof HTMLButtonElement && target.disabled)) return { state: "disabled" };
-        target.scrollIntoView({ block: "center" });
-        const rect = target.getBoundingClientRect();
-        return { state: "ready", x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+        const allowed = ${JSON.stringify(PAGE_SETUP_ACTIONS.map((label) => label.toLowerCase()))};
+        const candidates = [...document.querySelectorAll('[role="button"], button, a')].filter(visible).map((element) => ({
+          element,
+          label: (element.getAttribute("aria-label") || element.innerText || "").trim(),
+        })).filter((candidate) => allowed.includes(candidate.label.toLowerCase()));
+        const enabled = (element) => element.getAttribute("aria-disabled") !== "true" &&
+          !element.hasAttribute("disabled") && getComputedStyle(element).pointerEvents !== "none" &&
+          !(element instanceof HTMLButtonElement && element.disabled);
+        const uploadBusy = [...document.querySelectorAll('[aria-busy="true"], [role="status"], [aria-live]')]
+          .filter(visible).some((element) => element.getAttribute("aria-busy") === "true" ||
+            /\\b(uploading|processing|saving|preparing)\\b/i.test(element.innerText || ""));
+        const body = (document.body?.innerText || "").replace(/\\s+/g, " ").trim();
+        const headings = [...document.querySelectorAll('h1, h2, [role="heading"]')]
+          .filter(visible).map((element) => (element.innerText || "").trim()).filter(Boolean);
+        const heading = headings.join(" | ");
+        const stepMatch = body.match(/\\bstep\\s+(\\d+)\\s+of\\s+\\d+\\b/i);
+        const step = stepMatch ? Number(stepMatch[1]) : null;
+        for (const expected of ${JSON.stringify(priority)}) {
+          const candidate = candidates.find((item) => item.label.toLowerCase() === expected.toLowerCase() && enabled(item.element));
+          if (!candidate) continue;
+          if (uploadBusy) return { state: "processing" };
+          candidate.element.scrollIntoView({ block: "center" });
+          return { state: "ready", label: candidate.label, heading, step };
+        }
+        return { state: uploadBusy ? "processing" : candidates.length ? "disabled" : "waiting" };
       })()`);
     } catch (error) {
       if (!isTransientExecutionContextError(error)) throw error;
+      readySignature = "";
+      readySince = 0;
       await delay(350);
       continue;
     }
     if (state && typeof state === "object" && "state" in state && state.state === "ready" &&
-        "x" in state && typeof state.x === "number" && "y" in state && typeof state.y === "number") {
-      await clickWithNativeInput(command, state.x, state.y);
-      if (process.env.NODE_ENV !== "production") {
-        console.info(`[page-create] Clicked Facebook's ${label} button after image upload.`);
+        "label" in state && typeof state.label === "string" && "heading" in state &&
+        typeof state.heading === "string" &&
+        "step" in state && (state.step === null || typeof state.step === "number")) {
+      const signature = `${state.label}|${state.heading}|${state.step ?? "unknown"}`;
+      if (signature !== readySignature) {
+        readySignature = signature;
+        readySince = Date.now();
       }
-      await delay(800);
-      return true;
+      if (Date.now() - readySince < stableReadyMs) {
+        await delay(500);
+        continue;
+      }
+      const clicked = await evaluatePageScript(command, `(() => {
+        const label = ${JSON.stringify(state.label)};
+        const expectedStep = ${JSON.stringify(state.step)};
+        const visible = (element) => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" &&
+            style.display !== "none" && element.getClientRects().length > 0;
+        };
+        const enabled = (element) => element.getAttribute("aria-disabled") !== "true" &&
+          !element.hasAttribute("disabled") && getComputedStyle(element).pointerEvents !== "none" &&
+          !(element instanceof HTMLButtonElement && element.disabled);
+        const body = (document.body?.innerText || "").replace(/\\s+/g, " ");
+        const stepMatch = body.match(/\\bstep\\s+(\\d+)\\s+of\\s+\\d+\\b/i);
+        const currentStep = stepMatch ? Number(stepMatch[1]) : null;
+        if (expectedStep !== null && currentStep !== expectedStep) return false;
+        const uploadBusy = [...document.querySelectorAll('[aria-busy="true"], [role="status"], [aria-live]')]
+          .filter(visible).some((element) => element.getAttribute("aria-busy") === "true" ||
+            /\\b(uploading|processing|saving|preparing)\\b/i.test(element.innerText || ""));
+        if (uploadBusy) return false;
+        const button = [...document.querySelectorAll('[role="button"], button, a')].find((element) =>
+          visible(element) && enabled(element) &&
+          (element.getAttribute("aria-label") || element.innerText || "").trim().toLowerCase() === label.toLowerCase());
+        if (!button) return false;
+        button.focus({ preventScroll: true });
+        button.click();
+        return true;
+      })()`);
+      if (clicked !== true) {
+        readySignature = "";
+        readySince = 0;
+        await delay(350);
+        continue;
+      }
+      if (process.env.NODE_ENV !== "production") {
+        console.info(`[page-create] Activated Facebook's ${state.label} control after it remained ready for ${stableReadyMs} ms.`);
+      }
+      return {
+        label: state.label as PageSetupAction,
+        beforeHeading: state.heading,
+        beforeStep: state.step as number | null,
+      };
+    }
+    readySignature = "";
+    readySince = 0;
+    await delay(350);
+  }
+  return null;
+}
+
+async function waitForPageSetupProgress(
+  command: CdpCommand,
+  clickedLabel: string,
+  beforeHeading: string,
+  beforeStep: number | null = null,
+  timeoutMs = 180_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const snapshot = await readPageSetupSnapshot(command);
+      if (snapshot && ((beforeStep !== null && snapshot.step !== null && snapshot.step !== beforeStep) ||
+          (beforeHeading && snapshot.heading && snapshot.heading !== beforeHeading) ||
+          (!snapshot.actions.some((label) => label.toLowerCase() === clickedLabel.toLowerCase()) && snapshot.actions.length > 0))) return true;
+    } catch (error) {
+      if (!isTransientExecutionContextError(error)) throw error;
     }
     await delay(350);
   }
   return false;
 }
 
+async function hasFacebookPageImageUploadControls(command: CdpCommand) {
+  const value = await evaluatePageScript(command, `(() => {
+    const kinds = new Set();
+    for (const input of document.querySelectorAll('input[type="file"][accept*="image"]')) {
+      let container = input.parentElement;
+      for (let depth = 0; container && depth < 12; depth++, container = container.parentElement) {
+        const text = (container.innerText || "").toLowerCase();
+        if (text.includes("add profile picture")) kinds.add("profile");
+        if (text.includes("add cover photo")) kinds.add("cover");
+      }
+    }
+    return kinds.has("profile") && kinds.has("cover");
+  })()`);
+  return value === true;
+}
+
+async function waitForFacebookPageImageUploads(
+  command: CdpCommand,
+  uploadStartedAt: number,
+  timeoutMs = PAGE_IMAGE_UPLOAD_WAIT_MS,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastCompletedCount = -1;
+  while (Date.now() < deadline) {
+    const value = await evaluatePageScript(command, `(() => {
+      const startedAt = ${JSON.stringify(uploadStartedAt)};
+      const uploads = performance.getEntriesByType("resource").filter((entry) => {
+        try {
+          return new URL(entry.name, location.href).pathname === "/profile/picture/upload/" &&
+            entry.startTime >= startedAt;
+        } catch {
+          return false;
+        }
+      });
+      const completed = uploads.filter((entry) => entry.responseEnd > 0);
+      return {
+        total: uploads.length,
+        completed: completed.length,
+        successful: completed.filter((entry) => entry.responseStatus >= 200 && entry.responseStatus < 300).length,
+        failed: completed.filter((entry) => entry.responseStatus >= 400).length,
+      };
+    })()`);
+    if (!value || typeof value !== "object" || !("total" in value) || typeof value.total !== "number" ||
+        !("completed" in value) || typeof value.completed !== "number" ||
+        !("successful" in value) || typeof value.successful !== "number" ||
+        !("failed" in value) || typeof value.failed !== "number") {
+      await delay(500);
+      continue;
+    }
+    if (value.failed > 0) {
+      if (process.env.NODE_ENV !== "production") {
+        console.warn("[page-create] Facebook returned an error for a profile or cover image upload.", value);
+      }
+      return false;
+    }
+    if (value.completed !== lastCompletedCount && process.env.NODE_ENV !== "production") {
+      console.info(`[page-create] Facebook image uploads completed: ${value.completed} of 2.`);
+      lastCompletedCount = value.completed;
+    }
+    if (value.total >= 2 && value.completed >= 2 && value.successful >= 2) {
+      if (process.env.NODE_ENV !== "production") {
+        console.info("[page-create] Facebook confirmed successful profile and cover image upload responses.");
+      }
+      return true;
+    }
+    await delay(500);
+  }
+  if (process.env.NODE_ENV !== "production") {
+    console.warn("[page-create] Facebook did not confirm both image uploads before the wait timed out.");
+  }
+  return false;
+}
+
 async function uploadPageImages(command: CdpCommand, images: PageImages) {
   await command("DOM.enable", {});
-  const uploadDeadline = Date.now() + 10_000;
+  // Facebook can accept Create Page immediately but take a while to render the
+  // profile setup dialog after Next. Keep waiting for the actual file inputs
+  // instead of treating a slow SPA transition as a missing upload step.
+  const uploadDeadline = Date.now() + 90_000;
   let profileInputIndex: number | undefined;
   let coverInputIndex: number | undefined;
   while (Date.now() < uploadDeadline) {
@@ -483,7 +783,12 @@ async function uploadPageImages(command: CdpCommand, images: PageImages) {
     coverInputIndex = undefined;
     await delay(400);
   }
-  if (profileInputIndex === undefined || coverInputIndex === undefined) return false;
+  if (profileInputIndex === undefined || coverInputIndex === undefined) {
+    if (process.env.NODE_ENV !== "production") {
+      console.warn("[page-create] Facebook's profile setup upload inputs were still unavailable 90 seconds after Next.");
+    }
+    return false;
+  }
 
   const documentResponse = await command("DOM.getDocument", { depth: -1, pierce: true });
   const rootNodeId = documentResponse.result?.root?.nodeId;
@@ -520,6 +825,10 @@ async function uploadPageImages(command: CdpCommand, images: PageImages) {
       writeFile(profileImagePath, images.profileImage, { flag: "wx" }),
       writeFile(coverImagePath, images.coverImage, { flag: "wx" }),
     ]);
+  const uploadStartedAt = await evaluatePageScript(command, "performance.now()");
+  if (typeof uploadStartedAt !== "number") {
+    throw new Error("Facebook image upload timing could not be observed.");
+  }
     await command("DOM.setFileInputFiles", {
       nodeId: inputNodeIds[profileInputIndex],
       files: [profileImagePath],
@@ -528,47 +837,17 @@ async function uploadPageImages(command: CdpCommand, images: PageImages) {
       nodeId: inputNodeIds[coverInputIndex],
       files: [coverImagePath],
     });
-
-    const verificationDeadline = Date.now() + 5_000;
-    while (Date.now() < verificationDeadline) {
-      let attached: unknown;
-      try {
-        attached = await evaluatePageScript(command, `(() => {
-          const inputs = [...document.querySelectorAll('input[type="file"][accept*="image"]')];
-          const kindAt = (index) => {
-            let container = inputs[index]?.parentElement;
-            for (let depth = 0; container && depth < 12; depth++, container = container.parentElement) {
-              const text = (container.innerText || "").toLowerCase();
-              if (text.includes("add profile picture")) return "profile";
-              if (text.includes("add cover photo")) return "cover";
-            }
-            return "unknown";
-          };
-          const result = {};
-          inputs.forEach((input, index) => {
-            const kind = kindAt(index);
-            if (kind !== "unknown") result[kind] = input.files?.[0]?.name || "";
-          });
-          return result;
-        })()`);
-      } catch (error) {
-        if (!isTransientExecutionContextError(error)) throw error;
-        await delay(300);
-        continue;
-      }
-      if (attached && typeof attached === "object" &&
-          "profile" in attached && attached.profile === `profile.${profileExtension}` &&
-          "cover" in attached && attached.cover === `cover.${coverExtension}`) {
-        if (process.env.NODE_ENV !== "production") {
-          console.info("[page-create] Attached profile and cover images to Facebook's upload controls.");
-        }
-        return true;
-      }
-      await delay(300);
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[page-create] Submitted profile and cover images to Facebook; waiting for upload responses.");
     }
-    throw new Error("Facebook did not confirm both selected images. Check the Cent window before continuing.");
+    // Facebook can clear or replace these file inputs as it consumes the files,
+    // so checking input.files after selection can report a false failure even
+    // while the uploaded previews and requests are already successful.
+    // Await before finally removes the image files: Cent may still be reading
+    // them while Facebook's upload requests are in flight.
+    return await waitForFacebookPageImageUploads(command, uploadStartedAt);
   } finally {
-    await rm(imageDirectory, { recursive: true, force: true });
+    await removeTemporaryPageImages(imageDirectory);
   }
 }
 
@@ -800,15 +1079,19 @@ export async function populateFacebookPageForm(
 ): Promise<"images-uploaded" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "post-upload-step-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"> {
   const targetDeadline = Date.now() + TARGET_WAIT_MS;
   let target: DevToolsTarget | null = null;
+  let knownTargets: DevToolsTarget[] = [];
   while (Date.now() < targetDeadline && !target) {
-    target = await getFacebookTarget(profilePath);
+    knownTargets = await getFacebookTargets(profilePath);
+    target = knownTargets[0] ?? null;
     if (!target) await delay(300);
   }
   if (!target?.webSocketDebuggerUrl) {
     throw new Error("Cent did not expose its local Facebook automation endpoint.");
   }
 
-  const socket = await connect(target.webSocketDebuggerUrl);
+  let socket = await connect(target.webSocketDebuggerUrl);
+  const originalSocket = socket;
+  let stopNetworkObservation = () => {};
   try {
     let commandId = 0;
     const command: CdpCommand = (method, params) => sendCommand(socket, ++commandId, method, params);
@@ -958,6 +1241,8 @@ export async function populateFacebookPageForm(
       if (fillResponse.result?.exceptionDetails) throw new Error("Facebook Page form population script failed.");
       if (fillResponse.result?.result?.value !== true) { await delay(500); continue; }
 
+      // Let Facebook settle validation and rerender after long or emoji-heavy bios.
+      await delay(1_500);
       const normalizeCategory = (value: string) => value.normalize("NFKD")
         .replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
       const expectedCategory = normalizeCategory(details.category);
@@ -1173,12 +1458,13 @@ export async function populateFacebookPageForm(
                     element.offsetParent !== null;
                 };
                 const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]')].filter(visible);
-                const fieldText = (element) => [
-                  element.getAttribute("aria-label"),
-                  element.getAttribute("placeholder"),
-                  element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
-                  element.closest("label")?.innerText,
-                ].filter(Boolean).join(" ").trim().toLowerCase();
+                const fieldText = (element) => {
+                  const labelText = element.labels ? [...element.labels]
+                    .flatMap((label) => [...label.querySelectorAll("span")].map((span) => span.innerText.trim()))
+                    .find(Boolean) : "";
+                  return (element.getAttribute("aria-label") || element.getAttribute("placeholder") ||
+                    labelText || element.closest("label")?.innerText || "").trim().toLowerCase();
+                };
                 const findField = (pattern) => {
                   const direct = fields.find((field) => pattern.test(fieldText(field)));
                   if (direct) return direct;
@@ -1188,14 +1474,18 @@ export async function populateFacebookPageForm(
                   return label?.control ??
                     label?.querySelector('input, textarea, [role="textbox"], [role="combobox"], [contenteditable="true"]');
                 };
-                const valueOf = (field) => field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
-                  ? field.value.trim()
-                  : field.textContent?.trim() || "";
+                const normalizeValue = (value) => (value || "").replace(/\\u00a0/g, " ")
+                  .replace(/\\r\\n?/g, "\\n").replace(/[ \\t]+/g, " ").trim();
+                const valueOf = (field) => normalizeValue(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+                  ? field.value
+                  : field instanceof HTMLElement && field.isContentEditable ? field.innerText : field.innerText || field.textContent || "");
                 const name = findField(/^page\\s*name(?:\\s*\\(required\\))?$/);
                 const bio = findField(/^bio(?:\\s*\\(optional\\))?$/);
+                const nameMatches = Boolean(name && valueOf(name) === normalizeValue(expected.name));
+                const bioMatches = Boolean(bio && valueOf(bio) === normalizeValue(expected.bio));
                 const category = [...document.querySelectorAll('[aria-label="Selected values"] [role="listitem"]')]
                   .map((element) => element.innerText.trim()).filter(Boolean);
-                if (!name || valueOf(name) !== expected.name || !bio || valueOf(bio) !== expected.bio) {
+                if (!name || valueOf(name) !== normalizeValue(expected.name) || !bio || valueOf(bio) !== normalizeValue(expected.bio)) {
                   return {
                     state: "fields-unverified",
                     nameFound: Boolean(name),
@@ -1226,23 +1516,83 @@ export async function populateFacebookPageForm(
 
             await delay(2_000);
 
+            await command("Network.enable", {});
+            const networkObserver = observePageNetwork(socket);
+            stopNetworkObservation = networkObserver.dispose;
             const createResult = await clickCreatePageButton(command, details);
             if (createResult === "fields-unverified") return "fields-unverified";
+            if (createResult === "category-unverified") return "category-unverified";
             if (createResult !== "clicked") return "create-button-unavailable";
 
-            const nextClicked = await clickNextButton(command);
-            if (!nextClicked) return "next-button-unavailable";
+            // Facebook may open the newly created Page flow in another tab.
+            // Wait for either the same tab's Next control or a new
+            // Facebook target, then direct the rest of the automation there.
+            const knownTargetIds = new Set(knownTargets.flatMap((item) => item.id ? [item.id] : []));
+            // Facebook can take several minutes to finish the create request before
+            // it renders the setup flow. Keep watching both the current tab and
+            // newly opened Facebook tabs during that response window.
+            const createdTarget = await waitForNewFacebookTarget(
+              profilePath,
+              knownTargetIds,
+              command,
+              PAGE_CREATE_RESPONSE_WAIT_MS,
+            );
+            if (createdTarget?.webSocketDebuggerUrl) {
+              socket = await connect(createdTarget.webSocketDebuggerUrl);
+              await sendCommand(socket, ++commandId, "Page.enable", {});
+              await sendCommand(socket, ++commandId, "Runtime.enable", {});
+              if (process.env.NODE_ENV !== "production") {
+                console.info("[page-create] Switched automation to Facebook's newly opened Page setup tab.");
+              }
+            }
+
+            // Use the actual upload controls to identify the photo step. If
+            // Facebook is still on the success screen, click its visible Next
+            // action first; do not depend on the localized step-counter text.
+            let alreadyOnImageStep = false;
+            try {
+              alreadyOnImageStep = await hasFacebookPageImageUploadControls(command);
+            } catch (error) {
+              if (!isTransientExecutionContextError(error)) throw error;
+            }
+            if (!alreadyOnImageStep) {
+              const initialNextClicked = await clickAvailablePageSetupAction(command, "Next", PAGE_CREATE_RESPONSE_WAIT_MS);
+              if (!initialNextClicked) return "next-button-unavailable";
+            }
 
             const imagesUploaded = await uploadPageImages(command, images);
             if (!imagesUploaded) return "image-upload-unavailable";
-            for (const step of ["Next", "Skip", "Next", "Done"]) {
-              const clicked = await clickPageSetupButton(command, step);
-              if (!clicked) {
-                console.warn(`[page-create] Waiting for Facebook's post-upload ${step} button timed out.`);
+            await delay(2_000);
+            const postUploadActions = ["Next", "Skip", "Next", "Done"] as const;
+            for (let actionIndex = 0; actionIndex < postUploadActions.length; actionIndex++) {
+              const expectedAction = postUploadActions[actionIndex];
+              const action = await clickAvailablePageSetupAction(
+                command,
+                expectedAction,
+                180_000,
+                actionIndex === 0 ? PAGE_ACTION_STABLE_MS : 0,
+              );
+              if (!action) {
+                if (process.env.NODE_ENV !== "production") {
+                  console.warn(`[page-create] Facebook did not show an enabled ${expectedAction} action after image upload.`);
+                }
+                return "post-upload-step-unavailable";
+              }
+              if (expectedAction === "Done") return "images-uploaded";
+              const advanced = await waitForPageSetupProgress(
+                command,
+                action.label,
+                action.beforeHeading,
+                action.beforeStep,
+              );
+              if (!advanced) {
+                if (process.env.NODE_ENV !== "production") {
+                  console.warn(`[page-create] Facebook did not confirm a step change after ${expectedAction}.`);
+                }
                 return "post-upload-step-unavailable";
               }
             }
-            return "images-uploaded";
+            return "post-upload-step-unavailable";
           }
           if (categoryResult.state === "missing") break;
         }
@@ -1252,6 +1602,8 @@ export async function populateFacebookPageForm(
     }
     return "form-unavailable";
   } finally {
+    stopNetworkObservation();
     socket.close();
+    if (originalSocket !== socket) originalSocket.close();
   }
 }
