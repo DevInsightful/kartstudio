@@ -15,6 +15,7 @@ type CdpResponse = {
   params?: Record<string, unknown>;
   result?: {
     result?: { value?: unknown };
+    targetId?: string;
     windowId?: number;
     nodeId?: number;
     nodeIds?: number[];
@@ -169,6 +170,113 @@ async function getFacebookTargets(profilePath: string): Promise<DevToolsTarget[]
 
 async function getFacebookTarget(profilePath: string): Promise<DevToolsTarget | null> {
   return (await getFacebookTargets(profilePath))[0] ?? null;
+}
+
+export type FacebookManagedPage = { name: string; followerCount: number | null };
+
+export async function readFacebookManagedPages(profilePath: string): Promise<FacebookManagedPage[]> {
+  const activePort = await readFile(path.join(profilePath, DEBUG_PORT_FILE), "utf8");
+  const [portLine, browserPath] = activePort.split(/\r?\n/);
+  const port = Number(portLine);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535 || !browserPath?.startsWith("/devtools/browser/")) {
+    throw new Error("Cent's browser connection is not ready. Reopen this account profile and retry.");
+  }
+
+  const browser = await connect(`ws://127.0.0.1:${port}${browserPath}`);
+  let pageSocket: WebSocket | null = null;
+  let targetId: string | null = null;
+  try {
+    const created = await sendCommand(browser, 1, "Target.createTarget", {
+      url: "https://www.facebook.com/pages/?category=your_pages",
+      newWindow: false,
+    });
+    targetId = typeof created.result?.targetId === "string" ? created.result.targetId : null;
+    if (!targetId) throw new Error("Cent could not open a temporary Facebook Pages tab.");
+
+    const deadline = Date.now() + 30_000;
+    let target: DevToolsTarget | undefined;
+    while (Date.now() < deadline) {
+      target = (await getFacebookTargets(profilePath)).find((item) => item.id === targetId);
+      if (target?.webSocketDebuggerUrl) break;
+      await delay(250);
+    }
+    if (!target?.webSocketDebuggerUrl) throw new Error("Facebook's Pages list did not open in this account profile.");
+
+    pageSocket = await connect(target.webSocketDebuggerUrl);
+    let commandId = 0;
+    const command: CdpCommand = (method, params) => sendCommand(pageSocket!, ++commandId, method, params);
+    await command("Page.enable", {});
+
+    const inspectDeadline = Date.now() + 45_000;
+    let pages: FacebookManagedPage[] = [];
+    while (Date.now() < inspectDeadline) {
+      const result = await evaluatePageScript(command, `(() => {
+        const visible = (element) => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' &&
+            style.display !== 'none' && element.getClientRects().length > 0;
+        };
+        const countFrom = (text) => {
+          const match = text.match(/([\\d,.]+)\\s*([KMB])?\\s+followers?\\b/i);
+          if (!match) return null;
+          const value = Number(match[1].replace(/,/g, ''));
+          const multiplier = ({ K: 1e3, M: 1e6, B: 1e9 })[(match[2] || '').toUpperCase()] || 1;
+          return Number.isFinite(value) ? Math.round(value * multiplier) : null;
+        };
+        const candidates = new Map();
+        const pageContent = document.querySelector('[role="main"]') || document.body;
+        const excludedRoutes = new Set(['pages', 'watch', 'groups', 'reels', 'marketplace', 'friends', 'settings', 'notifications', 'messages', 'events']);
+        for (const anchor of pageContent.querySelectorAll('a[href]')) {
+          if (!visible(anchor)) continue;
+          const href = new URL(anchor.href, location.href);
+          if (href.hostname !== 'facebook.com' && !href.hostname.endsWith('.facebook.com')) continue;
+          const firstPath = href.pathname.split('/').filter(Boolean)[0]?.toLowerCase() || '';
+          if (excludedRoutes.has(firstPath) || (href.pathname === '/' && !href.searchParams.has('id'))) continue;
+          let container = anchor;
+          for (let depth = 0; container && depth < 6; depth++, container = container.parentElement) {
+            const text = (container.innerText || '').replace(/\\s+/g, ' ').trim();
+            if (!text) continue;
+            const lines = (container.innerText || '').split('\\n').map((line) => line.trim()).filter(Boolean);
+            const ignored = /^(manage|edit|view|see all|create|more|notifications|switch)$/i;
+            const name = lines.find((line) => !ignored.test(line) && !/\\bfollowers?\\b/i.test(line) && line.length <= 100);
+            if (!name) continue;
+            const key = href.pathname + href.search;
+            const followerCount = countFrom(text);
+            const previous = candidates.get(key);
+            if (!previous || (previous.followerCount === null && followerCount !== null)) {
+              candidates.set(key, { name, followerCount });
+            }
+            break;
+          }
+        }
+        return {
+          path: location.pathname,
+          body: (document.body?.innerText || '').slice(0, 8000),
+          pages: [...candidates.values()],
+        };
+      })()`);
+      if (result && typeof result === "object" && "path" in result && typeof result.path === "string" &&
+          "body" in result && typeof result.body === "string" && "pages" in result && Array.isArray(result.pages)) {
+        const body = result.body.toLowerCase();
+        if (/login|log in to facebook|create an account/.test(body) && !/your pages|managed pages/.test(body)) {
+          throw new Error("This Facebook account needs sign-in before its Pages can be listed.");
+        }
+        pages = result.pages.filter((item): item is FacebookManagedPage => item && typeof item === "object" &&
+          "name" in item && typeof item.name === "string" && "followerCount" in item &&
+          (item.followerCount === null || typeof item.followerCount === "number"));
+        if (pages.length || /no pages|you don't manage any pages|you do not manage any pages/i.test(body)) return pages;
+      }
+      await delay(500);
+    }
+    throw new Error("Facebook opened the Pages list, but KartStudio could not read its Page names and follower counts.");
+  } finally {
+    pageSocket?.close();
+    if (targetId) {
+      try { await sendCommand(browser, 2, "Target.closeTarget", { targetId }); } catch { /* Temporary tab may already be closed. */ }
+    }
+    browser.close();
+  }
 }
 
 async function waitForNewFacebookTarget(
@@ -326,6 +434,76 @@ async function clickWithNativeInput(command: CdpCommand, x: number, y: number) {
     button: "left",
     clickCount: 1,
   });
+}
+
+async function commitPageBioWithKeyboard(command: CdpCommand, bioValue: string) {
+  const position = await evaluatePageScript(command, `(() => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden" &&
+        element.offsetParent !== null;
+    };
+    const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [contenteditable="true"]')]
+      .filter(visible);
+    const fieldText = (element) => [
+      element.getAttribute("aria-label"),
+      element.getAttribute("placeholder"),
+      element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
+      element.closest("label")?.innerText,
+    ].filter(Boolean).join(" ").trim().toLowerCase();
+    const field = fields.find((element) => /^bio(?:\\s*\\(optional\\))?$/.test(fieldText(element))) ??
+      [...document.querySelectorAll("label")].find((label) => visible(label) &&
+        [...label.querySelectorAll("span")].some((span) => /^bio(?:\\s*\\(optional\\))?$/.test(span.innerText.trim().toLowerCase())))
+        ?.control;
+    if (!field) return null;
+    const rect = field.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  })()`);
+  if (!position || typeof position !== "object" || !("x" in position) || typeof position.x !== "number" ||
+      !("y" in position) || typeof position.y !== "number") return false;
+
+  await clickWithNativeInput(command, position.x, position.y);
+  await command("Input.dispatchKeyEvent", {
+    type: "keyDown", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65,
+  });
+  await command("Input.dispatchKeyEvent", {
+    type: "keyUp", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65,
+  });
+  await command("Input.insertText", { text: bioValue });
+  await command("Input.dispatchKeyEvent", {
+    type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9,
+  });
+  await command("Input.dispatchKeyEvent", {
+    type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9, nativeVirtualKeyCode: 9,
+  });
+  await delay(500);
+
+  const committedValue = await evaluatePageScript(command, `(() => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden" &&
+        element.offsetParent !== null;
+    };
+    const fields = [...document.querySelectorAll('input:not([type="hidden"]), textarea, [role="textbox"], [contenteditable="true"]')]
+      .filter(visible);
+    const fieldText = (element) => [
+      element.getAttribute("aria-label"),
+      element.getAttribute("placeholder"),
+      element.labels ? [...element.labels].map((label) => label.innerText).join(" ") : "",
+      element.closest("label")?.innerText,
+    ].filter(Boolean).join(" ").trim().toLowerCase();
+    const field = fields.find((element) => /^bio(?:\\s*\\(optional\\))?$/.test(fieldText(element))) ??
+      [...document.querySelectorAll("label")].find((label) => visible(label) &&
+        [...label.querySelectorAll("span")].some((span) => /^bio(?:\\s*\\(optional\\))?$/.test(span.innerText.trim().toLowerCase())))
+        ?.control;
+    if (!field) return "";
+    const value = field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement
+      ? field.value
+      : field instanceof HTMLElement && field.isContentEditable ? field.innerText : field.textContent;
+    return (value || "").replace(/\\u00a0/g, " ").replace(/\\r\\n?/g, "\\n").replace(/[ \\t]+/g, " ").trim();
+  })()`);
+  const expectedValue = bioValue.replace(/\u00a0/g, " ").replace(/\r\n?/g, "\n").replace(/[ \t]+/g, " ").trim();
+  return committedValue === expectedValue;
 }
 
 async function clickCreatePageButton(command: CdpCommand, details: PageDetails) {
@@ -1125,11 +1303,50 @@ export async function populateAndSubmitFacebookLogin(
   }
 }
 
+/** Wait for a user to finish a Facebook sign-in/checkpoint in the already-open Cent profile. */
+export async function waitForFacebookAuthentication(profilePath: string, timeoutMs = 5 * 60_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const target = await getFacebookTarget(profilePath);
+    if (target?.webSocketDebuggerUrl) {
+      let socket: WebSocket | null = null;
+      try {
+        socket = await connect(target.webSocketDebuggerUrl);
+        await sendCommand(socket, 1, "Runtime.enable", {});
+        const response = await sendCommand(socket, 2, "Runtime.evaluate", {
+          expression: `(() => {
+            if (document.readyState !== "complete") return "loading";
+            if (/\\/checkpoint|\\/two_factor|\\/recover/i.test(location.pathname)) return "waiting";
+            const email = document.querySelector('input[name="email"], #email');
+            const password = document.querySelector('input[name="pass"], #pass');
+            if (email instanceof HTMLInputElement && password instanceof HTMLInputElement) return "waiting";
+            const loggedInMarker = document.querySelector(
+              'a[href="/me/"], [aria-label="Account"], [aria-label="Your profile"], [data-pagelet="ProfileTilesFeed_0"]'
+            );
+            return loggedInMarker ? "authenticated" : "loading";
+          })()`,
+          returnByValue: true,
+        });
+        if (response.result?.result?.value === "authenticated") return true;
+      } catch (error) {
+        if (!isTransientExecutionContextError(error)) {
+          console.warn(`[facebook-login] Could not check the Cent profile while waiting for manual sign-in: ${error instanceof Error ? error.message : "Unknown error"}`);
+        }
+      } finally {
+        socket?.close();
+      }
+    }
+    await delay(1_000);
+  }
+  return false;
+}
+
 export async function populateFacebookPageForm(
   profilePath: string,
   details: PageDetails,
   images: PageImages,
-): Promise<"images-uploaded" | "completion-unconfirmed" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "post-upload-step-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"> {
+  options: { stopBeforeCreate?: boolean } = {},
+): Promise<"images-uploaded" | "completion-unconfirmed" | "setup-ready-for-review" | "next-clicked" | "created-clicked" | "login-required" | "checkpoint" | "category-unselected" | "create-button-unavailable" | "next-button-unavailable" | "image-upload-unavailable" | "post-upload-step-unavailable" | "fields-unverified" | "category-unverified" | "form-unavailable"> {
   const targetDeadline = Date.now() + TARGET_WAIT_MS;
   let target: DevToolsTarget | null = null;
   let knownTargets: DevToolsTarget[] = [];
@@ -1500,6 +1717,17 @@ export async function populateFacebookPageForm(
             await delay(350);
           }
           if (categoryResult.state === "selected") {
+            // Re-enter the Page bio through the browser's real input path after
+            // category selection. Facebook can display a script-set DOM value
+            // without committing it to the controlled form state.
+            const bioCommitted = await commitPageBioWithKeyboard(command, details.bio);
+            if (!bioCommitted) {
+              if (process.env.NODE_ENV !== "production") {
+                console.warn("[page-create] Bio did not survive keyboard entry and blur; refusing to submit.");
+              }
+              return "fields-unverified";
+            }
+
             const readyCheck = await sendCommand(socket, ++commandId, "Runtime.evaluate", {
               expression: `(() => {
                 const expected = ${JSON.stringify(details)};
@@ -1565,6 +1793,13 @@ export async function populateFacebookPageForm(
                 return readyState.state;
               }
               throw new Error("Facebook Page details could not be verified before creation. The Create Page button was not clicked.");
+            }
+
+            if (options.stopBeforeCreate) {
+              if (process.env.NODE_ENV !== "production") {
+                console.info("[page-create] Test mode: details verified; stopped before clicking Create Page.");
+              }
+              return "setup-ready-for-review";
             }
 
             await delay(2_000);

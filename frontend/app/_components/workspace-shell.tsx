@@ -29,6 +29,8 @@ const navigation = [
   {
     heading: "Publishing",
     items: [
+      { label: "Upload", href: "/publishing/upload", mark: "UP" },
+      { label: "Reels", href: "/publishing/reels", mark: "RL" },
       { label: "Calendar", href: "/publishing/calendar", mark: "CL" },
       { label: "Scheduled", href: "/publishing/scheduled", mark: "SC" },
       { label: "Published", href: "/publishing/published", mark: "PB" },

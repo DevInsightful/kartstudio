@@ -8,46 +8,47 @@ datasource db {
 }
 
 model Workspace {
-  id        String     @id @default(cuid())
-  name      String
-  createdAt DateTime   @default(now())
-  updatedAt DateTime   @updatedAt
-  accounts  Account[]
+  id         String          @id @default(cuid())
+  name       String
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  accounts   Account[]
   categories Category[]
-  tags      Tag[]
+  tags       Tag[]
   operations BulkOperation[]
-  pages     Page[]
-  campaigns Campaign[]
-  content   Content[]
-  presets   ContentPreset[]
-  jobs      AutomationJob[]
-  activity  ActivityLog[]
+  pages      Page[]
+  campaigns  Campaign[]
+  content    Content[]
+  presets    ContentPreset[]
+  jobs       AutomationJob[]
+  activity   ActivityLog[]
+  reelPosts  ReelPost[]
 }
 
 model Account {
-  id           Int               @id @default(autoincrement())
-  workspaceId  String
-  displayName  String
-  platform     String            @default("FACEBOOK")
-  username     String?
-  platformUid  String?
-  profileUrl   String?
-  status       String            @default("NOT_CONFIGURED")
+  id                Int                 @id @default(autoincrement())
+  workspaceId       String
+  displayName       String
+  platform          String              @default("FACEBOOK")
+  username          String?
+  platformUid       String?
+  profileUrl        String?
+  status            String              @default("NOT_CONFIGURED")
   statusBeforeTrash String?
-  notes        String?
-  categoryId   String?
-  createdAt    DateTime          @default(now())
-  updatedAt    DateTime          @updatedAt
-  deletedAt    DateTime?
-  workspace    Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  category     Category?         @relation(fields: [categoryId], references: [id], onDelete: SetNull)
-  credentials  CredentialRecord?
-  browserProfile BrowserProfile?
-  session      Session?
-  tags         AccountTag[]
-  activity     ActivityLog[]
-  operationItems BulkOperationItem[]
-  pages        Page[]
+  notes             String?
+  categoryId        String?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  deletedAt         DateTime?
+  workspace         Workspace           @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  category          Category?           @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  credentials       CredentialRecord?
+  browserProfile    BrowserProfile?
+  session           Session?
+  tags              AccountTag[]
+  activity          ActivityLog[]
+  operationItems    BulkOperationItem[]
+  pages             Page[]
 
   @@unique([workspaceId, username])
   @@unique([workspaceId, platform, platformUid])
@@ -66,24 +67,24 @@ model CredentialRecord {
 }
 
 model BrowserProfile {
-  id           String   @id @default(cuid())
-  accountId    Int      @unique
-  profilePath  String   @unique
-  status       String   @default("NOT_CREATED")
-  createdAt    DateTime @default(now())
+  id            String    @id @default(cuid())
+  accountId     Int       @unique
+  profilePath   String    @unique
+  status        String    @default("NOT_CREATED")
+  createdAt     DateTime  @default(now())
   lastStartedAt DateTime?
-  lastClosedAt DateTime?
-  account      Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  lastClosedAt  DateTime?
+  account       Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
 }
 
 model Session {
-  id                  String   @id @default(cuid())
-  accountId           Int      @unique
-  status              String   @default("UNKNOWN")
+  id                  String    @id @default(cuid())
+  accountId           Int       @unique
+  status              String    @default("UNKNOWN")
   lastCheckedAt       DateTime?
   lastAuthenticatedAt DateTime?
   lastError           String?
-  account             Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  account             Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
 }
 
 model Category {
@@ -104,7 +105,7 @@ model Tag {
   workspaceId String
   name        String
   createdAt   DateTime     @default(now())
-  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   accounts    AccountTag[]
 
   @@unique([workspaceId, name])
@@ -120,14 +121,14 @@ model AccountTag {
 }
 
 model ActivityLog {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   workspaceId String
   accountId   Int?
   type        String
   message     String
-  createdAt   DateTime @default(now())
+  createdAt   DateTime  @default(now())
   workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  account     Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  account     Account?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
 
   @@index([workspaceId, createdAt])
   @@index([accountId, createdAt])
@@ -161,18 +162,20 @@ model BulkOperationItem {
 }
 
 model Page {
-  id          String    @id @default(cuid())
-  workspaceId String
-  accountId   Int?
-  campaignId  String?
-  name        String
-  bio         String?
-  status      String    @default("DRAFT")
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  account     Account?  @relation(fields: [accountId], references: [id], onDelete: SetNull)
-  campaign    Campaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  id            String     @id @default(cuid())
+  workspaceId   String
+  accountId     Int?
+  campaignId    String?
+  name          String
+  bio           String?
+  status        String     @default("DRAFT")
+  followerCount Int?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  workspace     Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account       Account?   @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  campaign      Campaign?  @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  reelPosts     ReelPost[]
 }
 
 model Campaign {
@@ -214,6 +217,23 @@ model ContentPreset {
   workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
 
   @@unique([workspaceId, name])
+}
+
+model ReelPost {
+  id          String    @id @default(cuid())
+  workspaceId String
+  pageId      String
+  videoName   String
+  description String
+  status      String    @default("PENDING")
+  error       String?
+  postedAt    DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  page        Page      @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, status, createdAt])
 }
 
 model AutomationJob {

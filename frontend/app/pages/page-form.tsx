@@ -1,11 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useTransition } from "react";
-import { runPageCreationGroup } from "./actions";
+import { Fragment, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { runPageCreationGroup, syncFacebookPageInventory } from "./actions";
 import { FACEBOOK_PAGE_CATEGORIES } from "@/lib/facebook-page-categories";
 import { parsePageDetailsCsv } from "@/lib/page-details-csv";
 
-type AccountOption = { id: number; label: string; active: boolean };
+type AccountOption = {
+  id: number;
+  label: string;
+  active: boolean;
+  pages: { id: string; name: string; followerCount: number | null }[];
+};
 type FolderFile = File & { webkitRelativePath?: string };
 const PAGE_SIZES = [10, 25, 50, 100];
 const JOB_OPTIONS = [1, 2, 3, 4, 6, 8, 12, 16, 20];
@@ -39,13 +45,18 @@ export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
   const [pageSize, setPageSize] = useState(25);
   const [jobsAtOnce, setJobsAtOnce] = useState(2);
   const [category, setCategory] = useState("");
+  const [stopBeforeCreate, setStopBeforeCreate] = useState(false);
   const [detailsCsv, setDetailsCsv] = useState<File | null>(null);
   const [profileImages, setProfileImages] = useState<File[]>([]);
   const [coverImages, setCoverImages] = useState<File[]>([]);
   const [message, setMessage] = useState("");
   const [isError, setIsError] = useState(false);
   const [progress, setProgress] = useState("");
+  const [syncingAccountId, setSyncingAccountId] = useState<number | null>(null);
+  const [expandedAccountIds, setExpandedAccountIds] = useState<Set<number>>(() => new Set());
+  const [syncMessage, setSyncMessage] = useState("");
   const [isPending, startTransition] = useTransition();
+  const router = useRouter();
   const profileFolderRef = useRef<HTMLInputElement>(null);
   const coverFolderRef = useRef<HTMLInputElement>(null);
 
@@ -67,11 +78,34 @@ export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
     setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
   }
 
+  function toggleAccountPages(id: number) {
+    setExpandedAccountIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   function toggleVisibleAccounts() {
     const allVisibleSelected = activeVisible.length > 0 && activeVisible.every((account) => selectedSet.has(account.id));
     setSelectedIds((current) => allVisibleSelected
       ? current.filter((id) => !activeVisible.some((account) => account.id === id))
       : [...new Set([...current, ...activeVisible.map((account) => account.id)])]);
+  }
+
+  async function refreshAccountPages(accountId: number) {
+    setSyncingAccountId(accountId);
+    setSyncMessage("");
+    try {
+      const result = await syncFacebookPageInventory(accountId);
+      setSyncMessage(result.count ? `Loaded ${result.count} Page${result.count === 1 ? "" : "s"} from Facebook.` : "Facebook did not list any Pages for this account.");
+      router.refresh();
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : "Could not load Pages from Facebook.");
+    } finally {
+      setSyncingAccountId(null);
+    }
   }
 
   function startRun() {
@@ -138,6 +172,7 @@ export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
         formData.set("groupAccountIds", JSON.stringify(group.map((account) => account.id)));
         formData.set("groupStart", String(start));
         formData.set("category", category);
+        formData.set("stopBeforeCreate", String(stopBeforeCreate));
         formData.set("detailsCsv", csvFile);
         for (const file of profileImages.slice(start, start + group.length)) formData.append("profileImages", file, file.name);
         for (const file of coverImages.slice(start, start + group.length)) formData.append("coverImages", file, file.name);
@@ -167,7 +202,7 @@ export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
       </div>
     </div>
 
-    {accounts.length === 0 ? <p className="account-alert error-alert" role="status">No Facebook accounts are listed yet. Import accounts first, then verify the accounts you want to use are active.</p> : <>
+    {accounts.length === 0 ? <p className="account-alert error-alert" role="status">No active Facebook accounts are available. Import accounts first, then verify the accounts you want to use are active.</p> : <>
       <div className="page-account-toolbar">
         <strong>{selectedIds.length} selected</strong>
         <label>Rows per page
@@ -178,13 +213,27 @@ export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
       </div>
       <div className="page-account-list" role="region" aria-label="Facebook accounts">
         <table>
-          <thead><tr><th><input type="checkbox" aria-label="Select active accounts on this page" checked={activeVisible.length > 0 && selectedVisible.length === activeVisible.length} onChange={toggleVisibleAccounts} disabled={isPending || !activeVisible.length} /></th><th>Account</th><th>Status</th></tr></thead>
-          <tbody>{visibleAccounts.map((account) => <tr key={account.id}>
-            <td><input type="checkbox" aria-label={`Select ${account.label}`} checked={selectedSet.has(account.id)} onChange={() => toggleAccount(account.id)} disabled={isPending || !account.active} /></td>
-            <td>{account.label}</td><td><span className={account.active ? "page-account-active" : "page-account-inactive"}>{account.active ? "Active" : "Sign-in needed"}</span></td>
-          </tr>)}</tbody>
+          <thead><tr><th><input type="checkbox" aria-label="Select active accounts on this page" checked={activeVisible.length > 0 && selectedVisible.length === activeVisible.length} onChange={toggleVisibleAccounts} disabled={isPending || !activeVisible.length} /></th><th>Account ID</th><th>Account</th><th>Status</th><th>Pages</th></tr></thead>
+          <tbody>{visibleAccounts.map((account) => {
+            const expanded = expandedAccountIds.has(account.id);
+            return <Fragment key={account.id}>
+              <tr>
+                <td><input type="checkbox" aria-label={`Select ${account.label}`} checked={selectedSet.has(account.id)} onChange={() => toggleAccount(account.id)} disabled={isPending || !account.active} /></td>
+                <td><strong>ACC-{String(account.id).padStart(6, "0")}</strong></td>
+                <td>{account.label}</td><td><span className="page-account-active">Active</span></td>
+                <td><div className="page-account-pages-control"><span>{account.pages.length} {account.pages.length === 1 ? "Page" : "Pages"}</span><button type="button" className="page-account-expand" aria-expanded={expanded} aria-label={`${expanded ? "Hide" : "Show"} Pages for ACC-${String(account.id).padStart(6, "0")}`} onClick={() => toggleAccountPages(account.id)}>{expanded ? "Hide pages" : "Show pages"}</button></div></td>
+              </tr>
+              {expanded && <tr key={`${account.id}-pages`} className="page-account-details-row"><td colSpan={5}>
+                <div className="page-owned-header"><strong>Pages for ACC-{String(account.id).padStart(6, "0")}</strong><button type="button" className="page-inventory-refresh" onClick={() => refreshAccountPages(account.id)} disabled={isPending || syncingAccountId !== null}>{syncingAccountId === account.id ? "Loading…" : "Refresh from Facebook"}</button></div>
+                {account.pages.length ? <table className="page-owned-table"><thead><tr><th>Page name</th><th>Page ID</th><th>Followers</th></tr></thead><tbody>{account.pages.map((page) => <tr key={page.id}>
+                  <td>{page.name}</td><td>{page.id}</td><td>{page.followerCount === null ? "Unavailable" : page.followerCount.toLocaleString()}</td>
+                </tr>)}</tbody></table> : <span className="page-owned-empty">Refresh to load this account’s Pages</span>}
+              </td></tr>}
+            </Fragment>;
+          })}</tbody>
         </table>
       </div>
+      {syncMessage && <p className="account-alert" role="status">{syncMessage}</p>}
       <div className="page-pagination">
         <span>Page {currentPage} of {pageCount} · {accounts.length} accounts</span>
         <div><button type="button" onClick={() => setCurrentPage((page) => Math.max(1, page - 1))} disabled={isPending || currentPage <= 1}>Previous</button><button type="button" onClick={() => setCurrentPage((page) => Math.min(pageCount, page + 1))} disabled={isPending || currentPage >= pageCount}>Next</button></div>
@@ -217,7 +266,8 @@ export default function PageForm({ accounts }: { accounts: AccountOption[] }) {
       </label>
       {selectedAccounts.length > 0 && <div className="page-selection-order"><strong>Account and image order</strong><ol>{selectedAccounts.slice(0, 8).map((account, index) => <li key={account.id}>{index + 1}. {account.label} <span>← CSV row {index + 1} · profile image {index + 1} · cover image {index + 1}</span></li>)}</ol>{selectedAccounts.length > 8 && <small>…and {selectedAccounts.length - 8} more selected accounts.</small>}</div>}
       <p className="page-form-note">Each image must be 10 MB or smaller. The selected account count, CSV row count, and image count in each folder must match. Facebook may ask for extra verification; the affected job will be reported and the profile will close after the group finishes.</p>
-      <div className="page-form-actions"><button className="primary-button" type="button" onClick={startRun} disabled={isPending || !selectedIds.length || !category || !detailsCsv || !profileImages.length || !coverImages.length}>{isPending ? "Creating Pages…" : `Create ${selectedIds.length || "selected"} Pages`}</button></div>
+      <label className="page-form-test-mode"><input type="checkbox" checked={stopBeforeCreate} onChange={(event) => setStopBeforeCreate(event.target.checked)} disabled={isPending} /> Stop after entering and verifying the name, category, and bio; do not click Facebook’s Create Page button. Leave Cent profiles open for review.</label>
+      <div className="page-form-actions"><button className="primary-button" type="button" onClick={startRun} disabled={isPending || !selectedIds.length || !category || !detailsCsv || !profileImages.length || !coverImages.length}>{isPending ? (stopBeforeCreate ? "Checking Page details…" : "Creating Pages…") : stopBeforeCreate ? `Test ${selectedIds.length || "selected"} Page forms` : `Create ${selectedIds.length || "selected"} Pages`}</button></div>
     </>}
     {progress && <p className="account-alert" role="status">{progress}</p>}
     {message && <pre className={`account-alert page-batch-result ${isError ? "error-alert" : "success-alert"}`} role={isError ? "alert" : "status"}>{message}</pre>}
