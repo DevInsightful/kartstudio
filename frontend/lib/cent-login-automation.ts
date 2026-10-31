@@ -65,7 +65,7 @@ function isTransientExecutionContextError(error: unknown) {
   return /cannot find default execution context|execution context was destroyed|context with specified id not found|inspected target navigated or closed/i.test(message);
 }
 
-async function restoreCentWindow(profilePath: string, bounds: WindowBounds) {
+export async function restoreCentWindow(profilePath: string, bounds: WindowBounds) {
   const script = `
 $ErrorActionPreference = 'Stop'
 $profile = [Environment]::GetEnvironmentVariable('KARTSTUDIO_PROFILE_PATH')
@@ -227,8 +227,11 @@ export async function readFacebookManagedPages(profilePath: string): Promise<Fac
         const candidates = new Map();
         const pageContent = document.querySelector('[role="main"]') || document.body;
         const excludedRoutes = new Set(['pages', 'watch', 'groups', 'reels', 'marketplace', 'friends', 'settings', 'notifications', 'messages', 'events']);
+        const excludedNames = new Set(['create post', 'messages', 'promote', 'manage', 'edit', 'view', 'see all', 'create', 'more', 'notifications', 'switch']);
         for (const anchor of pageContent.querySelectorAll('a[href]')) {
           if (!visible(anchor)) continue;
+          const anchorLabel = (anchor.getAttribute('aria-label') || anchor.innerText || '').trim().toLocaleLowerCase();
+          if (excludedNames.has(anchorLabel)) continue;
           const href = new URL(anchor.href, location.href);
           if (href.hostname !== 'facebook.com' && !href.hostname.endsWith('.facebook.com')) continue;
           const firstPath = href.pathname.split('/').filter(Boolean)[0]?.toLowerCase() || '';
@@ -238,8 +241,7 @@ export async function readFacebookManagedPages(profilePath: string): Promise<Fac
             const text = (container.innerText || '').replace(/\\s+/g, ' ').trim();
             if (!text) continue;
             const lines = (container.innerText || '').split('\\n').map((line) => line.trim()).filter(Boolean);
-            const ignored = /^(manage|edit|view|see all|create|more|notifications|switch)$/i;
-            const name = lines.find((line) => !ignored.test(line) && !/\\bfollowers?\\b/i.test(line) && line.length <= 100);
+            const name = lines.find((line) => !excludedNames.has(line.toLocaleLowerCase()) && !/\\bfollowers?\\b/i.test(line) && line.length <= 100);
             if (!name) continue;
             const key = href.pathname + href.search;
             const followerCount = countFrom(text);
@@ -264,7 +266,8 @@ export async function readFacebookManagedPages(profilePath: string): Promise<Fac
         }
         pages = result.pages.filter((item): item is FacebookManagedPage => item && typeof item === "object" &&
           "name" in item && typeof item.name === "string" && "followerCount" in item &&
-          (item.followerCount === null || typeof item.followerCount === "number"));
+          (item.followerCount === null || typeof item.followerCount === "number") &&
+          !/^(create post|messages|promote)$/i.test(item.name.trim()));
         if (pages.length || /no pages|you don't manage any pages|you do not manage any pages/i.test(body)) return pages;
       }
       await delay(500);

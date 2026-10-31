@@ -7,7 +7,7 @@ import { revalidatePath } from "next/cache";
 import path from "node:path";
 import { promisify } from "node:util";
 import { getLocalWorkspace, prisma } from "@/lib/prisma";
-import { populateAndSubmitFacebookLogin } from "@/lib/cent-login-automation";
+import { populateAndSubmitFacebookLogin, restoreCentWindow } from "@/lib/cent-login-automation";
 
 const MAX_BATCH_SIZE = 20;
 const FACEBOOK_HOME_URL = "https://www.facebook.com/";
@@ -87,7 +87,10 @@ async function launchOne(
   const profilePath = profileDirectory(accountId);
   mkdirSync(profilePath, { recursive: true });
   const prior = await prisma.browserProfile.findUnique({ where: { accountId }, select: { status: true } });
-  if (prior?.status === "OPEN" && reuseOpenProfile) return {};
+  if (prior?.status === "OPEN" && reuseOpenProfile) {
+    await restoreCentWindow(profilePath, bounds);
+    return {};
+  }
   if (prior?.status === "OPEN" || prior?.status === "STARTING") {
     return { error: "This account profile is already marked open. Close its Cent window before launching it again." };
   }

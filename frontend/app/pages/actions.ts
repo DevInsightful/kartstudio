@@ -99,6 +99,12 @@ export async function syncFacebookPageInventory(accountId: number): Promise<{ co
         });
       }
     }
+    if (pages.length) {
+      await prisma.page.updateMany({
+        where: { workspaceId: workspace.id, accountId, status: "ACTIVE", name: { in: ["Create Post", "Messages", "Promote"] } },
+        data: { status: "INACTIVE" },
+      });
+    }
     revalidatePath("/pages");
     return { count: pages.length };
   } finally {

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { WorkspaceShell } from "./_components/workspace-shell";
+import { getCurrentUser } from "@/lib/auth";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -10,10 +11,11 @@ export const metadata: Metadata = {
   description: "A workspace for preparing and monitoring browser automation workflows.",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default async function RootLayout({ children }: LayoutProps<"/">) {
+  const user = await getCurrentUser();
   return (
     <html lang="en">
-      <body><WorkspaceShell>{children}</WorkspaceShell></body>
+      <body><WorkspaceShell user={user}>{children}</WorkspaceShell></body>
     </html>
   );
 }

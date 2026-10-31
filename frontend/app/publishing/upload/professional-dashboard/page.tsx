@@ -17,7 +17,7 @@ export default async function ProfessionalDashboardUploadPage() {
   return <div className="section-page">
     <section className="section-intro">
       <p className="eyebrow">UPLOAD · PROFESSIONAL DASHBOARD</p>
-      <p>Select Facebook Pages under their owning accounts. Choose one video for each selected Page, or select one Page and upload a batch of Reels to it.</p>
+      <p>Choose one Page and upload all videos from its folder together, or select multiple Pages and choose how many Page account profiles to process at once.</p>
       <Link className="professional-upload-back" href="/publishing/upload">← Upload destinations</Link>
     </section>
     <ProfessionalDashboardForm pages={pages.filter((page) => page.account).map((page) => ({

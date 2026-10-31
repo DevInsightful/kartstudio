@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useState, type ReactNode } from "react";
+import type { CurrentUser } from "@/lib/auth";
+import { logoutAction } from "@/app/auth-actions";
 
 const navigation = [
   {
@@ -51,12 +53,13 @@ const navigation = [
 
 const pageTitles = navigation.flatMap((group) => group.items);
 
-export function WorkspaceShell({ children }: { children: ReactNode }) {
+export function WorkspaceShell({ children, user }: { children: ReactNode; user: CurrentUser | null }) {
+  if (!user) return <main className="auth-shell">{children}</main>;
   const pathname = usePathname();
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [openPanel, setOpenPanel] = useState<"notifications" | "profile" | null>(null);
-  const currentPage = pageTitles.find((item) => item.href === pathname) ?? pageTitles[0];
+  const currentPage = pageTitles.find((item) => item.href === pathname) ?? (pathname === "/admin/users" ? { label: "Platform users", href: pathname, mark: "US" } : pageTitles[0]);
   const pathParts = pathname.split("/").filter(Boolean);
   const parentLabel = pathParts.length > 1
     ? navigation.find((group) => group.items.some((item) => item.href.startsWith(`/${pathParts[0]}/`)))?.heading
@@ -96,6 +99,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
               })}
             </div>
           ))}
+          {user.role === "ADMIN" && <div className="nav-group"><p className="nav-heading">Platform</p><Link className={`nav-link${pathname.startsWith("/admin/users") ? " is-active" : ""}`} href="/admin/users"><span className="nav-mark" aria-hidden="true">US</span><span className="nav-label">Users</span></Link></div>}
         </nav>
         <button
           className="collapse-button"
@@ -127,9 +131,9 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
             <span className="header-divider" />
             <div className="popover-anchor">
               <button className="profile-button" aria-label="Application menu" aria-expanded={openPanel === "profile"} onClick={() => togglePanel("profile")}>
-                <span className="avatar">KS</span><span className="profile-label">Workspace</span><span className="profile-chevron">⌄</span>
+                <span className="avatar">{user.username.slice(0, 2).toUpperCase()}</span><span className="profile-label">{user.username}</span><span className="profile-chevron">⌄</span>
               </button>
-              {openPanel === "profile" && <div className="header-popover profile-popover"><strong>KartStudio</strong><p>Local workspace</p><Link href="/settings" onClick={() => setOpenPanel(null)}>Workspace settings</Link></div>}
+              {openPanel === "profile" && <div className="header-popover profile-popover"><strong>{user.username}</strong><p>{user.email || "No email set"}</p><Link href="/settings" onClick={() => setOpenPanel(null)}>Workspace settings</Link><form action={logoutAction}><button type="submit" className="profile-logout">Sign out</button></form></div>}
             </div>
           </div>
         </header>

@@ -249,7 +249,49 @@ async function setVideos(run: Command, files: StoredUploadFile[], mode: "reel" |
   throw new Error("Facebook did not open a video file picker. The Content Library remains open for review.");
 }
 
-async function waitForBulkUploadAndSave(run: Command, expectedVideos: number) {
+async function setBulkDescriptions(run: Command, expectedVideos: number, description: string) {
+  if (!description.trim()) return;
+  const selector = `(() => {
+    const visible = element => { const rect=element.getBoundingClientRect(), style=getComputedStyle(element); return rect.width>0 && rect.height>0 && style.display!=='none' && style.visibility!=='hidden'; };
+    return [...document.querySelectorAll('[contenteditable="true"][role="textbox"]')].filter(element => visible(element) && element.getAttribute('aria-placeholder') === "What's on your mind?");
+  })()`;
+  const deadline = Date.now() + 30_000;
+  let count = 0;
+  while (Date.now() < deadline) {
+    count = await evaluate(run, `(${selector}).length`) as number;
+    if (count === expectedVideos) break;
+    await delay(400);
+  }
+  if (count !== expectedVideos) throw new Error(`Facebook showed ${count} description fields for ${expectedVideos} uploaded videos. The upload remains open so no videos are saved without the shared description.`);
+
+  for (let index = 0; index < expectedVideos; index++) {
+    const position = await evaluate(run, `(() => {
+      const visible = element => { const rect=element.getBoundingClientRect(), style=getComputedStyle(element); return rect.width>0 && rect.height>0 && style.display!=='none' && style.visibility!=='hidden'; };
+      const fields=[...document.querySelectorAll('[contenteditable="true"][role="textbox"]')].filter(element => visible(element) && element.getAttribute('aria-placeholder') === "What's on your mind?");
+      const field=fields[${index}];
+      if (!field) return null;
+      field.scrollIntoView({ block:'center', inline:'nearest' });
+      const rect=field.getBoundingClientRect();
+      return { x:rect.left+rect.width/2, y:rect.top+rect.height/2 };
+    })()`);
+    if (!position || typeof position !== "object" || !("x" in position) || typeof position.x !== "number" || !("y" in position) || typeof position.y !== "number") {
+      throw new Error(`Facebook's description field for video ${index + 1} disappeared. The upload remains open for review.`);
+    }
+    await run("Input.dispatchMouseEvent", { type: "mousePressed", x: position.x, y: position.y, button: "left", clickCount: 1 });
+    await run("Input.dispatchMouseEvent", { type: "mouseReleased", x: position.x, y: position.y, button: "left", clickCount: 1 });
+    await run("Input.dispatchKeyEvent", { type: "keyDown", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65 });
+    await run("Input.dispatchKeyEvent", { type: "keyUp", key: "a", code: "KeyA", modifiers: 2, windowsVirtualKeyCode: 65 });
+    await run("Input.insertText", { text: description });
+    const verified = await evaluate(run, `(() => {
+      const visible = element => { const rect=element.getBoundingClientRect(), style=getComputedStyle(element); return rect.width>0 && rect.height>0 && style.display!=='none' && style.visibility!=='hidden'; };
+      const fields=[...document.querySelectorAll('[contenteditable="true"][role="textbox"]')].filter(element => visible(element) && element.getAttribute('aria-placeholder') === "What's on your mind?");
+      return fields[${index}]?.innerText?.trim() === ${JSON.stringify(description.trim())};
+    })()`);
+    if (verified !== true) throw new Error(`Facebook did not confirm the shared description for video ${index + 1}. The upload remains open for review.`);
+  }
+}
+
+async function waitForBulkUploadAndSave(run: Command, expectedVideos: number, description = "") {
   const ready = await waitFor(run, `(() => {
     const visible = element => { const rect=element.getBoundingClientRect(); const style=getComputedStyle(element); return rect.width>0 && rect.height>0 && style.display!=='none' && style.visibility!=='hidden'; };
     const body = document.body?.innerText || '';
@@ -258,6 +300,8 @@ async function waitForBulkUploadAndSave(run: Command, expectedVideos: number) {
     return !!count && Number(count[1]) === ${expectedVideos} && Number(count[2]) === ${expectedVideos} && !!save && save.getAttribute('aria-disabled') !== 'true' && save.disabled !== true;
   })()`, UPLOAD_WAIT_MS);
   if (!ready) throw new Error(`Facebook did not confirm all ${expectedVideos} videos uploaded with Save enabled. The bulk upload window is left open for review.`);
+
+  await setBulkDescriptions(run, expectedVideos, description);
 
   const beforeUrl = await evaluate(run, "location.href");
   if (!await clickLabel(run, "^save$", 15_000, true)) throw new Error("All videos uploaded, but Facebook's enabled Save button could not be clicked. The window is left open.");
@@ -333,7 +377,7 @@ export async function uploadViaProfessionalDashboard(
     }
 
     await setVideos(pageCommand, files, "bulk");
-    await waitForBulkUploadAndSave(pageCommand, files.length);
+    await waitForBulkUploadAndSave(pageCommand, files.length, description);
     return `Facebook uploaded all ${files.length} videos and confirmed Save. The bulk upload was saved for “${pageName}”.`;
   } finally {
     pageSocket?.close();
