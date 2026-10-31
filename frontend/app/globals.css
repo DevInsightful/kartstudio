@@ -11,6 +11,12 @@
   --font-sans: Arial, Helvetica, sans-serif;
 }
 
+.shared-videos-option { display: flex; align-items: flex-start; gap: 10px; margin: 14px 0 4px; padding: 12px 14px; border: 1px solid #dfe7e1; border-radius: 9px; background: #fbfdfb; cursor: pointer; }
+.shared-videos-option > input { margin: 3px 0 0; accent-color: #197454; }
+.shared-videos-option > span { display: grid; gap: 4px; }
+.shared-videos-option strong { color: #304239; font-size: 12px; }
+.shared-videos-option small { color: #718077; }
+
 * { box-sizing: border-box; }
 
 html, body { min-height: 100%; }

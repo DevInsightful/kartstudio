@@ -18,6 +18,7 @@ export async function uploadProfessionalDashboardFiles(formData: FormData): Prom
   if (!Array.isArray(pageIds) || !pageIds.length || pageIds.some((id) => typeof id !== "string")) throw new Error("Select at least one active Facebook Page.");
   if (new Set(pageIds).size !== pageIds.length) throw new Error("A Page can only be selected once.");
   const singlePageBatch = formData.get("singlePageBatch") === "true";
+  const sameVideosForAllPages = !singlePageBatch && formData.get("sameVideosForAllPages") === "true";
   if (singlePageBatch !== (pageIds.length === 1)) throw new Error("Select one Page for batch upload, or multiple Pages for one Reel per Page.");
   const batchSize = Number(formData.get("batchSize"));
   if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_FILES_PER_PAGE) throw new Error(`Batch size must be between 1 and ${MAX_FILES_PER_PAGE}.`);
@@ -35,16 +36,20 @@ export async function uploadProfessionalDashboardFiles(formData: FormData): Prom
   if (rawFiles.some((file) => !(file instanceof File))) throw new Error("Choose video files to upload.");
   const files = rawFiles as File[];
   if (!files.length || files.length > MAX_TOTAL_FILES) throw new Error(`Choose between 1 and ${MAX_TOTAL_FILES} videos per run.`);
-  if (!singlePageBatch && pageVideoCounts.reduce((total, count) => total + count, 0) !== files.length) throw new Error("The video folders must contain exactly the videos listed for the selected Pages.");
+  const assignedVideoCount = singlePageBatch ? files.length : pageVideoCounts.reduce((total, count) => total + count, 0);
+  if (!singlePageBatch && sameVideosForAllPages) {
+    if (pageVideoCounts.some((count) => count !== pageVideoCounts[0]) || pageVideoCounts[0] !== files.length) throw new Error("Choose one shared folder of videos for every selected Page.");
+  } else if (!singlePageBatch && assignedVideoCount !== files.length) throw new Error("The video folders must contain exactly the videos listed for the selected Pages.");
+  if (assignedVideoCount > MAX_TOTAL_FILES) throw new Error(`Choose no more than ${MAX_TOTAL_FILES} total Page video uploads per run.`);
   if (files.some((file) => !file.name || !VIDEO_EXTENSION.test(file.name) || file.size <= 0)) throw new Error("Choose non-empty MP4, MOV, WebM, M4V, 3GP, AVI, or MKV files.");
-  if (files.reduce((total, file) => total + file.size, 0) > MAX_TOTAL_BYTES) throw new Error("Keep the total upload under 400 MB.");
+  if (files.reduce((total, file) => total + file.size, 0) * (sameVideosForAllPages ? pageIds.length : 1) > MAX_TOTAL_BYTES) throw new Error("Keep the total upload under 400 MB across all selected Pages.");
   if (singlePageBatch) {
     if (files.length > MAX_FILES_PER_PAGE) throw new Error(`Choose no more than ${MAX_FILES_PER_PAGE} videos for one Page per run.`);
     const uniqueNames = new Set(files.map((file) => file.name.toLocaleLowerCase()));
     if (uniqueNames.size !== files.length) throw new Error("Each video needs a different filename.");
   } else {
     let offset = 0;
-    for (const count of pageVideoCounts) {
+    for (const count of sameVideosForAllPages ? [files.length] : pageVideoCounts) {
       const names = new Set(files.slice(offset, offset + count).map((file) => file.name.toLocaleLowerCase()));
       if (names.size !== count) throw new Error("Each Page folder must have different video filenames.");
       offset += count;
@@ -87,8 +92,8 @@ export async function uploadProfessionalDashboardFiles(formData: FormData): Prom
     let offset = 0;
     const jobs = orderedPages.map((page, index) => {
       const count = pageVideoCounts[index];
-      const job = { page, files: uploadFiles.slice(offset, offset + count) };
-      offset += count;
+      const job = { page, files: sameVideosForAllPages ? uploadFiles : uploadFiles.slice(offset, offset + count) };
+      if (!sameVideosForAllPages) offset += count;
       return job;
     });
     const batches: typeof jobs[] = [];

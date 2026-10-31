@@ -36,7 +36,9 @@ export default function ProfessionalDashboardForm({ pages = [] }: { pages?: Page
   const [expandedAccount, setExpandedAccount] = useState<number | null>(accounts.length > 0 ? accounts[0].id : null);
   const [batchSize, setBatchSize] = useState(4);
   const [description, setDescription] = useState("");
+  const [sameVideosForAllPages, setSameVideosForAllPages] = useState(false);
   const [singlePageVideos, setSinglePageVideos] = useState<File[]>([]);
+  const [sharedPageVideos, setSharedPageVideos] = useState<File[]>([]);
   const [parentFolderVideos, setParentFolderVideos] = useState<File[]>([]);
   const [manualFolders, setManualFolders] = useState<Record<string, { files: File[]; folderName: string }>>({});
   const [message, setMessage] = useState("");
@@ -48,6 +50,7 @@ export default function ProfessionalDashboardForm({ pages = [] }: { pages?: Page
   const selectedPages = useMemo(() => selectedIds.map((id) => pages.find((page) => page.id === id)).filter((page): page is PageOption => !!page), [pages, selectedIds]);
   const singlePageBatch = selectedPages.length === 1;
   const pageFolders = useMemo(() => selectedPages.map((page): PageFolder => {
+    if (sameVideosForAllPages) return { files: sharedPageVideos, folderName: sharedPageVideos.length ? pathParts(sharedPageVideos[0])[0] || "Selected folder" : "", source: sharedPageVideos.length ? "manual" : "missing" };
     const manual = manualFolders[page.id];
     if (manual) return { ...manual, source: "manual" };
     const matchingPages = selectedPages.filter((candidate) => normalizeFolderName(candidate.name) === normalizeFolderName(page.name));
@@ -57,7 +60,7 @@ export default function ProfessionalDashboardForm({ pages = [] }: { pages?: Page
     });
     if (matchingPages.length > 1) return { files: [], folderName: "", source: "missing" };
     return files.length ? { files, folderName: pathParts(files[0])[1], source: "auto" } : { files: [], folderName: "", source: "missing" };
-  }), [manualFolders, parentFolderVideos, selectedPages]);
+  }), [manualFolders, parentFolderVideos, sameVideosForAllPages, selectedPages, sharedPageVideos]);
   const totalVideos = singlePageBatch ? singlePageVideos.length : pageFolders.reduce((sum, folder) => sum + folder.files.length, 0);
   const totalBytes = useMemo(() => (singlePageBatch ? singlePageVideos : pageFolders.flatMap((folder) => folder.files)).reduce((sum, video) => sum + video.size, 0), [pageFolders, singlePageBatch, singlePageVideos]);
   const targetCount = totalVideos;
@@ -69,18 +72,22 @@ export default function ProfessionalDashboardForm({ pages = [] }: { pages?: Page
 
   function togglePage(id: string) {
     setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
-    setSinglePageVideos([]); setParentFolderVideos([]); setManualFolders({});
+    setSinglePageVideos([]); setSharedPageVideos([]); setParentFolderVideos([]); setManualFolders({});
   }
 
   function selectAllPages() {
     setSelectedIds((current) => current.length === pages.length ? [] : pages.map((page) => page.id));
-    setSinglePageVideos([]); setParentFolderVideos([]); setManualFolders({});
+    setSinglePageVideos([]); setSharedPageVideos([]); setParentFolderVideos([]); setManualFolders({});
   }
 
   function handleFolderChange(files: FileList | null) {
     if (!files) return;
     if (singlePageBatch) {
       setSinglePageVideos(sortVideos(files));
+      return;
+    }
+    if (sameVideosForAllPages) {
+      setSharedPageVideos(sortVideos(files));
       return;
     }
     setParentFolderVideos(sortVideos(files));
@@ -104,7 +111,7 @@ export default function ProfessionalDashboardForm({ pages = [] }: { pages?: Page
     if (!selectedPages.length) { setMessage("Select at least one Facebook Page."); setIsError(true); return; }
     if (singlePageBatch && !singlePageVideos.length) { setMessage("Choose at least one Reel for the selected Page."); setIsError(true); return; }
     if (!singlePageBatch && pageFolders.some((folder) => !folder.files.length)) {
-      setMessage("Choose a parent folder with a matching subfolder for each Page, or select a folder for each unmatched Page."); setIsError(true); return;
+      setMessage(sameVideosForAllPages ? "Choose one video folder to use for all selected Pages." : "Choose a parent folder with a matching subfolder for each Page, or select a folder for each unmatched Page."); setIsError(true); return;
     }
     if (singlePageBatch && singlePageVideos.length > MAX_FILES) { setMessage(`Choose no more than ${MAX_FILES} videos for one Page per run.`); setIsError(true); return; }
     if (!singlePageBatch && pageFolders.some((folder) => folder.files.length > MAX_FILES)) { setMessage(`Each Page can have no more than ${MAX_FILES} videos per run.`); setIsError(true); return; }
@@ -123,13 +130,15 @@ export default function ProfessionalDashboardForm({ pages = [] }: { pages?: Page
         data.set("pageIds", JSON.stringify(selectedPages.map((page) => page.id)));
         data.set("singlePageBatch", String(singlePageBatch));
         data.set("batchSize", String(batchSize));
+        data.set("sameVideosForAllPages", String(!singlePageBatch && sameVideosForAllPages));
         data.set("description", description);
         if (singlePageBatch) {
           singlePageVideos.forEach((video) => data.append("videos", video, video.name));
         } else {
           const counts = pageFolders.map((folder) => folder.files.length);
           data.set("pageVideoCounts", JSON.stringify(counts));
-          pageFolders.forEach((folder) => folder.files.forEach((video) => data.append("videos", video, video.name)));
+          const filesToUpload = sameVideosForAllPages ? sharedPageVideos : pageFolders.flatMap((folder) => folder.files);
+          filesToUpload.forEach((video) => data.append("videos", video, video.name));
         }
         const result = await uploadProfessionalDashboardFiles(data);
         setMessage(result.message); setIsError(false);
@@ -141,7 +150,7 @@ export default function ProfessionalDashboardForm({ pages = [] }: { pages?: Page
 
   return <section className="page-form-panel professional-upload-panel" aria-labelledby="professional-upload-title">
     <div className="page-form-heading"><div><p className="eyebrow">PROFESSIONAL DASHBOARD</p><h3 id="professional-upload-title">Upload Reels to Pages</h3>
-      <p>Choose one Page to upload every video from its folder together, or select multiple Pages and upload a parent folder with one subfolder per Page. For multiple Pages, choose how many different account profiles to process at once.</p></div></div>
+      <p>Choose one Page to upload every video from its folder together, or select multiple Pages and choose a different folder per Page or share one folder across all Pages. Set how many account profiles to process at once.</p></div></div>
     {!pages.length ? <div className="account-empty-state"><span className="empty-state-mark">!</span><h3>No active Pages</h3><p>Load Pages from active Facebook accounts first.</p><Link className="professional-upload-back" href="/pages">Open Pages</Link></div> : <>
       <div className="reels-toolbar"><strong>{selectedPages.length} Pages selected</strong><button type="button" onClick={selectAllPages} disabled={isPending}>{selectedPages.length === pages.length ? "Clear selection" : "Select all Pages"}</button></div>
       <div className="professional-upload-account-list" role="group" aria-label="Facebook accounts and Pages">
@@ -158,9 +167,10 @@ export default function ProfessionalDashboardForm({ pages = [] }: { pages?: Page
           </section>;
         })}
       </div>
-      <label className="modal-field">{singlePageBatch ? "Reel folder for this Page" : "Parent folder (one subfolder per Page)"}
+      {!singlePageBatch && selectedPages.length > 1 && <label className="shared-videos-option"><input type="checkbox" checked={sameVideosForAllPages} disabled={isPending} onChange={(event) => { setSameVideosForAllPages(event.target.checked); setSinglePageVideos([]); setSharedPageVideos([]); setParentFolderVideos([]); setManualFolders({}); }} /><span><strong>Use the same video folder for every selected Page</strong><small>Every selected Page receives all videos from the one folder.</small></span></label>}
+      <label className="modal-field">{singlePageBatch ? "Reel folder for this Page" : sameVideosForAllPages ? "Shared video folder" : "Parent folder (one subfolder per Page)"}
         <input ref={folderRef} type="file" multiple accept="video/*,.mp4,.mov,.webm,.m4v,.3gp,.avi,.mkv" onChange={(event) => handleFolderChange(event.target.files)} disabled={isPending} />
-        <small>{singlePageBatch ? (singlePageVideos.length ? `${singlePageVideos.length} videos selected · ${(totalBytes / (1024 * 1024)).toFixed(1)} MB` : "Select a folder containing the Reels for this Page.") : (parentFolderVideos.length ? `${parentFolderVideos.length} videos found in parent folder · ${totalVideos} assigned · ${(totalBytes / (1024 * 1024)).toFixed(1)} MB` : "Select a parent folder containing subfolders named after the selected Pages, for example Parent Folder/Page Name/video.mp4.")}</small>
+        <small>{singlePageBatch ? (singlePageVideos.length ? `${singlePageVideos.length} videos selected · ${(totalBytes / (1024 * 1024)).toFixed(1)} MB` : "Select a folder containing the Reels for this Page.") : sameVideosForAllPages ? (sharedPageVideos.length ? `${sharedPageVideos.length} videos in this folder · ${totalVideos} total Page uploads · ${(totalBytes / (1024 * 1024)).toFixed(1)} MB across selected Pages` : "Select one folder; its videos will be uploaded to every selected Page.") : (parentFolderVideos.length ? `${parentFolderVideos.length} videos found in parent folder · ${totalVideos} assigned · ${(totalBytes / (1024 * 1024)).toFixed(1)} MB` : "Select a parent folder containing subfolders named after the selected Pages, for example Parent Folder/Page Name/video.mp4.")}</small>
       </label>
       {!singlePageBatch && selectedPages.length > 0 && <>
       <label className="modal-field">Profiles per batch
